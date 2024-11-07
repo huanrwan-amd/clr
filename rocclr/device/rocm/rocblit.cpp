@@ -2307,7 +2307,7 @@ bool KernelBlitManager::copyBuffer(device::Memory& srcMemory, device::Memory& ds
               srcMemory.owner()->getSvmPtr() : srcMemory.owner()->getHostMem());
             std::memcpy(dst + dstOrigin[0], src + srcOrigin[0], sizeIn[0]);
             volatile uint8_t read =
-              *reinterpret_cast<volatile uint8_t*>(dst + dstOrigin[0] + size[0] - 1);
+              *reinterpret_cast<volatile uint8_t*>(dst + dstOrigin[0] + sizeIn[0] - 1);
             // Make sure HDP flush
             gpu().addSystemScope();
             return true;
