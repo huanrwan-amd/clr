@@ -257,6 +257,14 @@ release(uint, DEBUG_CLR_MAX_BATCH_SIZE, 1000,                                 \
         "Forces the callback to clean-up CPU submission queue")               \
 release(bool, DEBUG_HIP_KERNARG_COPY_OPT, true,                               \
          "Enable/Disable multiple kern arg copies")                           \
+release(uint, DEBUG_CLR_MAX_H2D_CPU, 16 * 1024,                               \
+        "Uses CPU H2D copies for less or equal sizes")                        \
+release(uint, DEBUG_CLR_MAX_D2H_CPU, 64,                                      \
+        "Uses CPU D2H copies for less or equal sizes")                        \
+release(uint, DEBUG_CLR_MAX_H2D_CPU_PIN, 0,                                   \
+        "Uses CPU H2D copies for less or equal sizes for pinned")             \
+release(uint, DEBUG_CLR_MAX_D2H_CPU_PIN, 0,                                   \
+        "Uses CPU D2H copies for less or equal sizes for pinned")             \
 release(bool, DEBUG_CLR_KERNARG_HDP_FLUSH_WA, false,                          \
         "Toggle kernel arg copy workaround")                                  \
 

@@ -1820,6 +1820,21 @@ bool KernelBlitManager::readBuffer(device::Memory& srcMemory, void* dstHost,
   amd::ScopedLock k(lockXferOps_);
   bool result = false;
 
+  if (dev().info().largeBar_ && size[0] <= DEBUG_CLR_MAX_D2H_CPU) {
+    if ((srcMemory.owner()->getHostMem() == nullptr) &&
+        (srcMemory.owner()->getSvmPtr() != nullptr)) {
+      // CPU read ahead, hence release GPU memory and force barrier to make sure L2 flush
+      constexpr bool kSkipWait = false;
+      constexpr bool kForceBarrier = true;;
+      gpu().releaseGpuMemoryFence(kSkipWait, kForceBarrier);
+      char* src = reinterpret_cast<char*>(srcMemory.owner()->getSvmPtr());
+      std::memcpy(dstHost, src + origin[0], size[0]);
+      // Force L2 invalidation/flush
+      gpu().hasPendingDispatch();
+      return true;
+    }
+  }
+
   // Use host copy if memory has direct access
   if (setup_.disableReadBuffer_ || (srcMemory.isHostMemDirectAccess() &&
       !srcMemory.isCpuUncached())) {
@@ -1926,6 +1941,22 @@ bool KernelBlitManager::writeBuffer(const void* srcHost, device::Memory& dstMemo
                                     bool entire, amd::CopyMetadata copyMetadata) const {
   amd::ScopedLock k(lockXferOps_);
   bool result = false;
+  if (dev().info().largeBar_ && (size[0] <= DEBUG_CLR_MAX_H2D_CPU)) {
+    if ((dstMemory.owner()->getHostMem() == nullptr) &&
+        (dstMemory.owner()->getSvmPtr() != nullptr)) {
+      // CPU write ahead, hence release GPU memory
+      constexpr bool kSkipWait = false;
+      constexpr bool kForceBarrier = true;;
+      gpu().releaseGpuMemoryFence(kSkipWait, kForceBarrier);
+      char* dst = reinterpret_cast<char*>(dstMemory.owner()->getSvmPtr());
+      std::memcpy(dst + origin[0], srcHost, size[0]);
+      volatile uint8_t read =
+        *reinterpret_cast<volatile uint8_t*>(dst + origin[0] + size[0] - 1);
+      // Make sure HDP flush
+      gpu().addSystemScope();
+      return true;
+    }
+  }
 
   // Use host copy if memory has direct access
   if (setup_.disableWriteBuffer_ || dstMemory.isHostMemDirectAccess() ||
@@ -2261,6 +2292,48 @@ bool KernelBlitManager::copyBuffer(device::Memory& srcMemory, device::Memory& ds
   asan = true;
 #endif
 #endif
+    if (amd::IS_HIP) {
+      if (srcMemory.isHostMemDirectAccess()) {
+        gpu().SetCopyCommandType(CL_COMMAND_WRITE_BUFFER);
+        if (dev().info().largeBar_ && sizeIn[0] <= DEBUG_CLR_MAX_H2D_CPU_PIN) {
+          if ((dstMemory.owner()->getHostMem() == nullptr) &&
+              (dstMemory.owner()->getSvmPtr() != nullptr)) {
+            // CPU read ahead, hence release GPU memory
+            constexpr bool kSkipWait = false;
+            constexpr bool kForceBarrier = true;
+            gpu().releaseGpuMemoryFence(kSkipWait, kForceBarrier);;
+            char* dst = reinterpret_cast<char*>(dstMemory.owner()->getSvmPtr());
+            char* src = reinterpret_cast<char*>((srcMemory.owner()->getSvmPtr() != nullptr) ?
+              srcMemory.owner()->getSvmPtr() : srcMemory.owner()->getHostMem());
+            std::memcpy(dst + dstOrigin[0], src + srcOrigin[0], sizeIn[0]);
+            volatile uint8_t read =
+              *reinterpret_cast<volatile uint8_t*>(dst + dstOrigin[0] + size[0] - 1);
+            // Make sure HDP flush
+            gpu().addSystemScope();
+            return true;
+          }
+        }
+      }
+      if (dstMemory.isHostMemDirectAccess()) {
+        gpu().SetCopyCommandType(CL_COMMAND_READ_BUFFER);
+        if (dev().info().largeBar_ && sizeIn[0] <= DEBUG_CLR_MAX_D2H_CPU_PIN) {
+          if ((srcMemory.owner()->getHostMem() == nullptr) &&
+              (srcMemory.owner()->getSvmPtr() != nullptr)) {
+            // CPU read ahead, hence release GPU memory and force barrier to make sure L2 flush
+            constexpr bool kSkipWait = false;
+            constexpr bool kForceBarrier = true;;
+            gpu().releaseGpuMemoryFence(kSkipWait, kForceBarrier);
+            char* src = reinterpret_cast<char*>(srcMemory.owner()->getSvmPtr());
+            char* dst = reinterpret_cast<char*>((dstMemory.owner()->getSvmPtr() != nullptr) ?
+              dstMemory.owner()->getSvmPtr() : dstMemory.owner()->getHostMem());
+            std::memcpy(dst + dstOrigin[0], src + srcOrigin[0], sizeIn[0]);
+            // Force L2 invalidation/flush
+            gpu().hasPendingDispatch();
+            return true;
+          }
+        }
+      }
+    }
 
   bool useShaderCopyPath = setup_.disableHwlCopyBuffer_ ||
       (sizeIn[0] <= dev().settings().sdmaCopyThreshold_) ||

@@ -1188,8 +1188,8 @@ void VirtualGPU::ResetQueueStates() {
 }
 
 // ================================================================================================
-bool VirtualGPU::releaseGpuMemoryFence(bool skip_cpu_wait) {
-  if (hasPendingDispatch_ || !Barriers().IsExternalSignalListEmpty()) {
+bool VirtualGPU::releaseGpuMemoryFence(bool skip_cpu_wait, bool force_barrier) {
+  if (force_barrier || hasPendingDispatch_ || !Barriers().IsExternalSignalListEmpty()) {
     // Dispatch barrier packet into the queue
     dispatchBarrierPacket(kBarrierPacketHeader);
     hasPendingDispatch_ = false;
