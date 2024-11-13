@@ -1184,7 +1184,7 @@ void VirtualGPU::ResetQueueStates() {
 
   // Release the pool, since runtime just completed a barrier
   // @note: Runtime can reset kernel arg pool only if the barrier with L2 invalidation was issued
-  resetKernArgPool();
+  // resetKernArgPool();
 }
 
 // ================================================================================================
