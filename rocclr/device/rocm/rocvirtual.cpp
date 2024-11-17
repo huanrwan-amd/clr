@@ -127,9 +127,6 @@ static unsigned extractAqlBits(unsigned v, unsigned pos, unsigned width) {
 
 // ================================================================================================
 void Timestamp::checkGpuTime() {
-  if (amd::IS_HIP && !amd::activity_prof::IsEnabled(OP_ID_DISPATCH)) {
-    return;
-  }
   amd::ScopedLock s(lock_);
   if (HwProfiling()) {
     uint64_t  start = std::numeric_limits<uint64_t>::max();
@@ -1184,7 +1181,7 @@ void VirtualGPU::ResetQueueStates() {
 
   // Release the pool, since runtime just completed a barrier
   // @note: Runtime can reset kernel arg pool only if the barrier with L2 invalidation was issued
-  // resetKernArgPool();
+  resetKernArgPool();
 }
 
 // ================================================================================================
