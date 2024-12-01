@@ -98,7 +98,7 @@ public:
   ProfilingSignal()
     : ts_(nullptr)
     , engine_(HwQueueEngine::Compute)
-    , lock_("Signal Ops Lock", true)
+    , lock_(true) /* Signal Ops Lock */
     , isPacketDispatch_(false)
     {
       signal_.handle = 0;
@@ -229,9 +229,9 @@ class NullDevice : public amd::Device {
     return nullptr;
   }
 
-  void virtualFree(void* addr) override {
+  bool virtualFree(void* addr) override {
     ShouldNotReachHere();
-    return;
+    return true;
   }
 
   virtual bool SetMemAccess(void* va_addr, size_t va_size, VmmAccess access_flags)
@@ -240,9 +240,14 @@ class NullDevice : public amd::Device {
     return false;
   }
 
-  virtual bool GetMemAccess(void* va_addr, VmmAccess* access_flags_ptr) override {
+  virtual bool GetMemAccess(void* va_addr, VmmAccess* access_flags_ptr) const {
     ShouldNotReachHere();
     return false;
+  }
+
+  virtual bool ValidateMemAccess(amd::Memory& mem, bool read_write) const {
+    ShouldNotReachHere();
+    return true;
   }
 
   //! Determine if we can use device memory for SVM
@@ -475,10 +480,11 @@ class Device : public NullDevice {
                                 size_t num_attributes, const void* dev_ptr, size_t count) const;
 
   virtual void* virtualAlloc(void* req_addr, size_t size, size_t alignment);
-  virtual void virtualFree(void* addr);
+  virtual bool virtualFree(void* addr);
 
   virtual bool SetMemAccess(void* va_addr, size_t va_size, VmmAccess access_flags);
-  virtual bool GetMemAccess(void* va_addr, VmmAccess* access_flags_ptr);
+  virtual bool GetMemAccess(void* va_addr, VmmAccess* access_flags_ptr) const;
+  virtual bool ValidateMemAccess(amd::Memory& mem, bool read_write) const { return true; }
 
   virtual bool ExportShareableVMMHandle(amd::Memory& amd_mem_obj, int flags, void* shareableHandle);
 
@@ -513,9 +519,6 @@ class Device : public NullDevice {
 
   //! Adds a map target to the cache
   bool addMapTarget(amd::Memory* memory) const;
-
-  //! Returns transfer buffer object
-  XferBuffers& xferWrite() const { return *xferWrite_; }
 
   //! Returns transfer buffer object
   XferBuffers& xferRead() const { return *xferRead_; }
@@ -563,7 +566,7 @@ class Device : public NullDevice {
                             amd::CommandQueue::Priority priority = amd::CommandQueue::Priority::Normal);
 
   //! Release HSA queue
-  void releaseQueue(hsa_queue_t*, const std::vector<uint32_t>& cuMask = {});
+  void releaseQueue(hsa_queue_t*, const std::vector<uint32_t>& cuMask = {}, bool coop_queue = false);
 
   //! For the given HSA queue, return an existing hostcall buffer or create a
   //! new one. queuePool_ keeps a mapping from HSA queue to hostcall buffer.
@@ -647,7 +650,6 @@ class Device : public NullDevice {
   VirtualGPU* xferQueue_;  //!< Transfer queue, created on demand
 
   XferBuffers* xferRead_;   //!< Transfer buffers read
-  XferBuffers* xferWrite_;  //!< Transfer buffers write
   std::atomic<size_t> freeMem_;   //!< Total of free memory available
   mutable amd::Monitor vgpusAccess_;     //!< Lock to serialise virtual gpu list access
   bool hsa_exclusive_gpu_access_;  //!< TRUE if current device was moved into exclusive GPU access mode

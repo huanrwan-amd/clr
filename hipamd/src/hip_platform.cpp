@@ -26,6 +26,8 @@
 #include "platform/runtime.hpp"
 
 #include <unordered_map>
+#include <mutex>
+
 namespace hip {
 constexpr unsigned __hipFatMAGIC2 = 0x48495046;  // "HIPF"
 
@@ -86,8 +88,13 @@ void __hipRegisterFunction(hip::FatBinaryInfo** modules, const void* hostFunctio
     return var ? atoi(var) : 1;
   }()};
   hipError_t hip_error = hipSuccess;
-  hip::Function* func = new hip::Function(std::string(deviceName), modules);
-  hip_error = PlatformState::instance().registerStatFunction(hostFunction, func);
+  // Compiler might share same hostFunction and hence it's needless to have another
+  // hip::Function and hip::Function is stored in map with hostFunction as key.
+  // Creating hip::Function in such case, Leaks it.
+  if (PlatformState::instance().getStatFuncName(hostFunction) == nullptr) {
+    hip::Function* func = new hip::Function(std::string(deviceName), modules);
+    hip_error = PlatformState::instance().registerStatFunction(hostFunction, func);
+  }
   guarantee((hip_error == hipSuccess), "Cannot register Static function, error: %d", hip_error);
 
   if (!enable_deferred_loading) {
@@ -177,11 +184,9 @@ void __hipRegisterTexture(
 void __hipUnregisterFatBinary(hip::FatBinaryInfo** modules) {
   // By calling hipDeviceSynchronize ensure that all HSA signal handlers
   // complete before removeFatBinary
-  hipError_t err = hipDeviceSynchronize();
-  if (err != hipSuccess) {
-    LogPrintfError("Error during hipDeviceSynchronize, error: %d", err);
-  }
-  err = PlatformState::instance().removeFatBinary(modules);
+  static std::once_flag unregister_device_sync;
+  std::call_once(unregister_device_sync, hipDeviceSynchronize);
+  hipError_t err = PlatformState::instance().removeFatBinary(modules);
   guarantee((err == hipSuccess), "Cannot Unregister Fat Binary, error:%d", err);
 }
 
@@ -273,6 +278,9 @@ hipError_t hipLaunchByPtr(const void* hostFunction) {
   size_t size = exec.arguments_.size();
   void* extra[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &exec.arguments_[0],
                    HIP_LAUNCH_PARAM_BUFFER_SIZE, &size, HIP_LAUNCH_PARAM_END};
+
+  STREAM_CAPTURE(hipLaunchByPtr, exec.hStream_, func, exec.blockDim_, exec.gridDim_,
+                 exec.sharedMem_, extra);
 
   HIP_RETURN(hipModuleLaunchKernel(func, exec.gridDim_.x, exec.gridDim_.y, exec.gridDim_.z,
                                    exec.blockDim_.x, exec.blockDim_.y, exec.blockDim_.z,
@@ -606,6 +614,9 @@ hipError_t hipOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(int* numBlocks,
 hipError_t ihipLaunchKernel(const void* hostFunction, dim3 gridDim, dim3 blockDim, void** args,
                             size_t sharedMemBytes, hipStream_t stream, hipEvent_t startEvent,
                             hipEvent_t stopEvent, int flags) {
+  if (!hip::isValid(stream)) {
+    return hipErrorInvalidValue;
+  }
   hipFunction_t func = nullptr;
   int deviceId = hip::Stream::DeviceId(stream);
   hipError_t hip_error = PlatformState::instance().getStatFunc(&func, hostFunction, deviceId);
@@ -616,6 +627,13 @@ hipError_t ihipLaunchKernel(const void* hostFunction, dim3 gridDim, dim3 blockDi
       return hipErrorInvalidDeviceFunction;
     }
   }
+
+  constexpr auto gridDimYZmax = static_cast<uint64_t>(std::numeric_limits<uint16_t>::max()) + 1;
+  const auto& isa = g_devices[deviceId]->devices()[0]->isa().versionMajor();
+  if (isa >= 12 && (gridDim.y > gridDimYZmax || gridDim.z > gridDimYZmax)) {
+    return hipErrorInvalidConfiguration;
+  }
+
   size_t globalWorkSizeX = static_cast<size_t>(gridDim.x) * blockDim.x;
   size_t globalWorkSizeY = static_cast<size_t>(gridDim.y) * blockDim.y;
   size_t globalWorkSizeZ = static_cast<size_t>(gridDim.z) * blockDim.z;
@@ -785,6 +803,12 @@ hipError_t PlatformState::getDynFunc(hipFunction_t* hfunc, hipModule_t hmod,
   }
 
   return it->second->getDynFunc(hfunc, func_name);
+}
+
+bool PlatformState::isValidDynFunc(const void* hfunc) {
+  amd::ScopedLock lock(lock_);
+  return std::any_of(dynCO_map_.begin(), dynCO_map_.end(),
+                     [&](auto& it) { return it.second->isValidDynFunc(hfunc); });
 }
 
 hipError_t PlatformState::getDynGlobalVar(const char* hostVar, hipModule_t hmod,

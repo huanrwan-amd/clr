@@ -392,7 +392,9 @@ hipError_t ihipDestroyTextureObject(hipTextureObject_t texObject) {
     return hipErrorNotSupported;
   }
 
-  texObject->image->release();
+  if (texObject != nullptr && texObject->image) {
+    texObject->image->release();
+  }
 
   // The texture object always owns the sampler SRD.
   texObject->sampler->release();
@@ -554,7 +556,8 @@ hipError_t ihipBindTexture(size_t* offset,
   }
 
   // Align the user ptr to HW requirments.
-  resDesc.res.linear.devPtr = static_cast<char*>(const_cast<void*>(devPtr)) - *offset;
+  resDesc.res.linear.devPtr =
+      static_cast<char*>(const_cast<void*>(devPtr)) - (offset != nullptr ? *offset : 0);
   hipTextureDesc texDesc = hip::getTextureDesc(texref);
 
   return ihipCreateTextureObject(const_cast<hipTextureObject_t*>(&texref->textureObject), &resDesc, &texDesc, nullptr);
@@ -569,7 +572,8 @@ hipError_t ihipBindTexture2D(size_t* offset,
                              size_t pitch) {
   if ((texref == nullptr) ||
       (devPtr == nullptr) ||
-      (desc == nullptr)) {
+      (desc == nullptr) ||
+      (pitch == 0)) {
     return hipErrorInvalidValue;
   }
 
@@ -594,7 +598,8 @@ hipError_t ihipBindTexture2D(size_t* offset,
   }
 
   // Align the user ptr to HW requirments.
-  resDesc.res.pitch2D.devPtr = static_cast<char*>(const_cast<void*>(devPtr)) - *offset;
+  resDesc.res.pitch2D.devPtr =
+      static_cast<char*>(const_cast<void*>(devPtr)) - (offset != nullptr ? *offset : 0);
   hipTextureDesc texDesc = hip::getTextureDesc(texref);
 
   return ihipCreateTextureObject(const_cast<hipTextureObject_t*>(&texref->textureObject), &resDesc, &texDesc, nullptr);
@@ -628,12 +633,6 @@ hipError_t hipBindTexture2D(size_t* offset,
 hipError_t ihipBindTextureToArray(const textureReference* texref,
                                   hipArray_const_t array,
                                   const hipChannelFormatDesc* desc) {
-  if ((texref == nullptr) ||
-      (array == nullptr) ||
-      (desc == nullptr)) {
-    return hipErrorInvalidValue;
-  }
-
   // Any previous address or HIP array state associated with the texture reference is superseded by this function.
   // Any memory previously bound to hTexRef is unbound.
   // No need to check for errors.
@@ -658,6 +657,10 @@ hipError_t hipBindTextureToArray(const textureReference* texref,
                                  hipArray_const_t array,
                                  const hipChannelFormatDesc* desc) {
   HIP_INIT_API(hipBindTextureToArray, texref, array, desc);
+
+  if ((texref == nullptr) || (array == nullptr) || (desc == nullptr)) {
+    return hipErrorInvalidValue;
+  }
 
   hipDeviceptr_t refDevPtr = nullptr;
   size_t refDevSize = 0;
@@ -1001,6 +1004,11 @@ hipError_t hipTexRefSetArray(textureReference* texRef,
     HIP_RETURN(err);
   }
 
+  // If flag = HIP_TRSA_OVERRIDE_FORMAT,
+  // Override the texref format with a format inferred from the array
+  texRef->format = array->Format;
+  texRef->numChannels = array->NumChannels;
+
   hipResourceDesc resDesc = {};
   resDesc.resType = hipResourceTypeArray;
   resDesc.res.array.array = const_cast<hipArray_t>(array);
@@ -1090,7 +1098,7 @@ hipError_t hipTexRefSetAddress(size_t* ByteOffset,
   }
 
   // Align the user ptr to HW requirments.
-  resDesc.res.linear.devPtr = static_cast<char*>(dptr) - *ByteOffset;
+  resDesc.res.linear.devPtr = static_cast<char*>(dptr) - (ByteOffset ? *ByteOffset : 0);
   hipTextureDesc texDesc = hip::getTextureDesc(texRef);
 
   err = ihipCreateTextureObject(&texRef->textureObject, &resDesc, &texDesc, nullptr);
@@ -1262,7 +1270,7 @@ hipError_t hipTexRefGetMaxAnisotropy(int* pmaxAnsio,
 
   *pmaxAnsio = texRef->maxAnisotropy;
 
-  HIP_RETURN(hipErrorInvalidValue);
+  HIP_RETURN(hipSuccess);
 }
 
 hipError_t hipTexRefGetMipmapFilterMode(hipTextureFilterMode* pfm,
@@ -1513,12 +1521,8 @@ hipError_t hipTexObjectCreate(hipTextureObject_t* pTexObject,
                               const HIP_RESOURCE_VIEW_DESC* pResViewDesc) {
   HIP_INIT_API(hipTexObjectCreate, pTexObject, pResDesc, pTexDesc, pResViewDesc);
 
-  if (pTexObject == nullptr) {
-    HIP_RETURN(hipErrorNotInitialized);
-  }
-
-  if (pResDesc == nullptr || pTexDesc == nullptr) {
-    HIP_RETURN(hipErrorInvalidContext);
+  if ((pTexObject == nullptr) || (pResDesc == nullptr) || (pTexDesc == nullptr)) {
+    HIP_RETURN(hipErrorInvalidValue);
   }
 
   hipResourceDesc resDesc = hip::getResourceDesc(*pResDesc);

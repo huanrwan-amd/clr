@@ -29,6 +29,7 @@ hipDeviceGetCacheConfig
 hipDeviceGetStreamPriorityRange
 hipDeviceGetLimit
 hipDeviceGetName
+hipDeviceGetTexture1DLinearMaxWidth
 hipDeviceGetUuid
 hipDeviceGetPCIBusId
 hipDeviceGetSharedMemConfig
@@ -478,3 +479,4 @@ hipGraphNodeSetParams
 hipGraphExecNodeSetParams
 hipDrvGraphMemcpyNodeSetParams
 hipDrvGraphMemcpyNodeGetParams
+hipExtHostAlloc

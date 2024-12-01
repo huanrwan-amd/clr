@@ -89,11 +89,14 @@ DeviceVar::DeviceVar(std::string name,
 }
 
 DeviceVar::~DeviceVar() {
-  if (amd_mem_obj_ != nullptr) {
+  // device_ptr_ is being removed and its amd:Memory obj is being released/deleted during
+  // ihipFree in hip::StatCO::removeFatBinary however in DynCO path, it seems to bypass 
+  // ihipFree and hence it needs to be removed+released here. In order to avoid issue with
+  // StatCO, It is better to check if mem obj is found.
+  if (amd::MemObjMap::FindMemObj(device_ptr_) !=  nullptr && amd_mem_obj_ != nullptr) {
     amd::MemObjMap::RemoveMemObj(device_ptr_);
     amd_mem_obj_->release();
   }
-
   if (shadowVptr != nullptr) {
     textureReference* texRef = reinterpret_cast<textureReference*>(shadowVptr);
     hipError_t err = ihipUnbindTexture(texRef);
@@ -147,6 +150,10 @@ hipError_t Function::getDynFunc(hipFunction_t* hfunc, hipModule_t hmod) {
   return hipSuccess;
 }
 
+bool Function::isValidDynFunc(const void* hfunc) {
+  return (hfunc == dFunc_[ihipGetDevice()]->asHipFunction());
+}
+
 hipError_t Function::getStatFunc(hipFunction_t* hfunc, int deviceId) {
   guarantee(modules_ != nullptr, "Module not initialized");
 
@@ -183,21 +190,21 @@ hipError_t Function::getStatFuncAttr(hipFuncAttributes* func_attr, int deviceId)
   const std::vector<amd::Device*>& devices = amd::Device::getDevices(CL_DEVICE_TYPE_GPU, false);
 
   amd::Kernel* kernel = dFunc_[deviceId]->kernel();
-  const device::Kernel::WorkGroupInfo* wginfo = kernel->getDeviceKernel(*devices[deviceId])->workGroupInfo();
+  auto* device_handle = devices[deviceId];
+  const device::Kernel::WorkGroupInfo* wginfo =
+              kernel->getDeviceKernel(*device_handle)->workGroupInfo();
+  int binaryVersion = device_handle->isa().versionMajor() * 10 +
+                      device_handle->isa().versionMinor();
   func_attr->sharedSizeBytes = static_cast<int>(wginfo->localMemSize_);
-  func_attr->binaryVersion = static_cast<int>(kernel->signature().version());
+  func_attr->binaryVersion = binaryVersion;
   func_attr->cacheModeCA = 0;
-  func_attr->constSizeBytes = 0;
+  func_attr->constSizeBytes = wginfo->constMemSize_ - 1;
   func_attr->localSizeBytes = wginfo->privateMemSize_;
-  func_attr->maxDynamicSharedSizeBytes = static_cast<int>(wginfo->availableLDSSize_
-                                                          - wginfo->localMemSize_);
-
+  func_attr->maxDynamicSharedSizeBytes = wginfo->maxDynamicSharedSizeBytes_;
   func_attr->maxThreadsPerBlock = static_cast<int>(wginfo->size_);
   func_attr->numRegs = static_cast<int>(wginfo->usedVGPRs_);
   func_attr->preferredShmemCarveout = 0;
-  func_attr->ptxVersion = 30;
-
-
+  func_attr->ptxVersion = binaryVersion;
   return hipSuccess;
 }
 
@@ -220,6 +227,16 @@ Var::~Var() {
     delete elem;
   }
   modules_ = nullptr;
+}
+
+hipError_t Var::getDeviceVarPtr(DeviceVar** dvar, int deviceId) {
+  guarantee((deviceId >= 0), "Invalid DeviceId, less than zero");
+  guarantee((static_cast<size_t>(deviceId) < g_devices.size()),
+            "Invalid DeviceId, greater than no of code objects");
+  guarantee((dVar_.size() == g_devices.size()),
+             "Device Var not initialized to size");
+  *dvar = dVar_[deviceId];
+  return hipSuccess;
 }
 
 hipError_t Var::getDeviceVar(DeviceVar** dvar, int deviceId, hipModule_t hmod) {

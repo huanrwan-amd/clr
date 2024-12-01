@@ -229,11 +229,14 @@ bool HsaAmdSignalHandler(hsa_signal_value_t value, void* arg) {
   // Save callback signal
   hsa_signal_t callback_signal = ts->GetCallbackSignal();
 
+  auto gpu = ts->gpu();
+  gpu->QueuedAsyncHandlers()--;
+
   // Reset last used SDMA engine mask
-  ts->gpu()->setLastUsedSdmaEngine(0);
+  gpu->setLastUsedSdmaEngine(0);
 
   // Update the batch, since signal is complete
-  ts->gpu()->updateCommandsState(ts->command().GetBatchHead());
+  gpu->updateCommandsState(ts->command().GetBatchHead());
 
   // Reset API callback signal. It will release AQL queue and start commands processing
   if (callback_signal.handle != 0) {
@@ -471,6 +474,7 @@ hsa_signal_t VirtualGPU::HwQueueTracker::ActiveSignal(
           hsa_signal_add_relaxed(prof_signal->signal_, 1);
           init_value += 1;
         }
+        gpu_.QueuedAsyncHandlers()++;
         hsa_status_t result = hsa_amd_signal_async_handler(prof_signal->signal_,
             HSA_SIGNAL_CONDITION_LT, init_value, &HsaAmdSignalHandler, ts);
         if (HSA_STATUS_SUCCESS != result) {
@@ -479,12 +483,10 @@ hsa_signal_t VirtualGPU::HwQueueTracker::ActiveSignal(
           ClPrint(amd::LOG_INFO, amd::LOG_SIG, "Set Handler: handle(0x%lx), timestamp(%p)",
             prof_signal->signal_.handle, prof_signal);
         }
-        SetHandlerPending(false);
         // Update the current command/marker with HW event
         prof_signal->retain();
         ts->command().SetHwEvent(prof_signal);
       } else if (ts->command().profilingInfo().marker_ts_) {
-        SetHandlerPending(true);
         // Update the current command/marker with HW event
         prof_signal->retain();
         ts->command().SetHwEvent(prof_signal);
@@ -999,7 +1001,16 @@ inline bool VirtualGPU::dispatchAqlPacket(
   auto packet = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(aqlpacket);
   ClPrint(amd::LOG_INFO, amd::LOG_KERN, "Graph shader name : %s",
           kernelName.c_str());
-  dispatchGenericAqlPacket(packet, packet->header, packet->setup, false);
+
+  // The Aqlpacket with valid header will trigger the issue that AQL fill
+  // the header before filling the body. However, the CP can handle the AQL package
+  // after seeing the valid AQL header with the AQL package's body is NULL.
+  // This patch fixes this potential issue that filling AQL header before
+  // filling the AQL body.
+  uint16_t packetHeader = packet->header;
+  packet->header = (HSA_PACKET_TYPE_INVALID << HSA_PACKET_HEADER_TYPE);
+  dispatchGenericAqlPacket(packet, packetHeader, packet->setup, false);
+  packet->header = packetHeader;
 
   profilingEnd(*vcmd);
 
@@ -1054,7 +1065,7 @@ void VirtualGPU::dispatchBarrierPacket(uint16_t packetHeader, bool skipSignal,
   fence_dirty_ = true;
   auto cache_state = extractAqlBits(packetHeader, HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE,
                          HSA_PACKET_HEADER_WIDTH_SCRELEASE_FENCE_SCOPE);
-  if (!skipSignal) {
+  if (!skipSignal && (signal.handle == 0)) {
     // Get active signal for current dispatch if profiling is necessary
     barrier_packet_.completion_signal =
       Barriers().ActiveSignal(kInitSignalValueOne, timestamp_);
@@ -1171,13 +1182,12 @@ void VirtualGPU::dispatchBarrierValuePacket(uint16_t packetHeader, bool resolveD
           barrier_value_packet_.cond == 0 ? "EQ" : barrier_value_packet_.cond == 1 ?
                                         "NE" : barrier_value_packet_.cond == 2 ? "LT" : "GTE",
           barrier_value_packet_.completion_signal);
+  // Clear dependent signals for the next packet
+  barrier_value_packet_.signal = hsa_signal_t{};
 }
 
 // ================================================================================================
 void VirtualGPU::ResetQueueStates() {
-  // Release all transfer buffers on this command queue
-  releaseXferWrite();
-
   // Release all memory dependencies
   memoryDependency().clear();
 
@@ -1221,6 +1231,7 @@ VirtualGPU::VirtualGPU(Device& device, bool profiling, bool cooperative,
       schedulerSignal_({0}),
       barriers_(*this),
       kernarg_pool_signal_(KernelArgPoolNumSignal),
+      managed_buffer_(*this, ManagedBuffer::kPoolNumSignals * device.settings().stagedXferSize_),
       cuMask_(cuMask),
       priority_(priority),
       copy_command_type_(0),
@@ -1319,7 +1330,7 @@ VirtualGPU::~VirtualGPU() {
   }
 
   if (gpu_queue_) {
-    roc_device_.releaseQueue(gpu_queue_, cuMask_);
+    roc_device_.releaseQueue(gpu_queue_, cuMask_, cooperative_);
   }
 }
 
@@ -1372,7 +1383,75 @@ bool VirtualGPU::create() {
     LogError("Could not create signal for copy queue!");
     return false;
   }
+  // Create managed buffer for staging copies
+  if (!managed_buffer_.Create()) {
+    LogError("Could not create managed buffer for this queue!");
+    return false;
+  }
   return true;
+}
+
+// ================================================================================================
+VirtualGPU::ManagedBuffer::~ManagedBuffer() {
+  for (auto& it : pool_signal_) {
+    if (it.handle != 0) {
+      hsa_signal_destroy(it);
+    }
+  }
+  if (pool_base_ != nullptr) {
+    gpu_.dev().hostFree(pool_base_, pool_size_);
+  }
+}
+
+// ================================================================================================
+bool VirtualGPU::ManagedBuffer::Create() {
+  pool_chunk_end_ = pool_size_ / kPoolNumSignals;
+  active_chunk_ = 0;
+  // Allocate memory for managed buffer
+  pool_base_ = reinterpret_cast<address>(
+    gpu_.dev().hostAlloc(pool_size_, 0, Device::MemorySegment::kNoAtomics));
+  if (pool_base_ == nullptr) {
+    return false;
+  }
+  hsa_agent_t agent = gpu_.dev().getBackendDevice();
+  for (auto& it : pool_signal_) {
+    if (HSA_STATUS_SUCCESS != hsa_signal_create(0, 1, &agent, &it)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// ================================================================================================
+address VirtualGPU::ManagedBuffer::Acquire(uint32_t size) {
+  auto alignment = gpu_.dev().info().globalMemCacheLineSize_;
+  address result = nullptr;
+  result = amd::alignUp(pool_base_ + pool_cur_offset_, alignment);
+  const size_t pool_new_usage = (result + size) - pool_base_;
+  if (pool_new_usage <= pool_chunk_end_) {
+    pool_cur_offset_ = pool_new_usage;
+    return result;
+  } else {
+    // Reset the signal for the barrier packet
+    hsa_signal_silent_store_relaxed(pool_signal_[active_chunk_], kInitSignalValueOne);
+    // Currently don't skip wait signal check, because SDMA engine cna be used in staging copy
+    constexpr bool kSkipSignal = false;
+    // Dispatch a barrier packet into the queue
+    gpu_.dispatchBarrierPacket(kBarrierPacketHeader, kSkipSignal, pool_signal_[active_chunk_]);
+    // Get the next chunk
+    active_chunk_ = ++active_chunk_ % kPoolNumSignals;
+    // Make sure the new active chunk is free
+    bool test = WaitForSignal(pool_signal_[active_chunk_], gpu_.ActiveWait());
+    assert(test && "Runtime can't fail a wait for chunk!");
+    // Make sure the current offset matches the new chunk to avoid possible overlaps
+    // between chunks and issues during recycle
+    pool_cur_offset_ = (active_chunk_ == 0) ? 0 : pool_chunk_end_;
+    pool_chunk_end_ = pool_cur_offset_ + pool_size_ / kPoolNumSignals;
+    result = amd::alignUp(pool_base_ + pool_cur_offset_, alignment);
+    pool_cur_offset_ = (result + size) - pool_base_;
+  }
+
+  return result;
 }
 
 // ================================================================================================
@@ -1384,6 +1463,11 @@ bool VirtualGPU::initPool(size_t kernarg_pool_size) {
       roc_device_.info().largeBar_) {
     kernarg_pool_base_ =
       reinterpret_cast<address>(roc_device_.deviceLocalAlloc(kernarg_pool_size_));
+    if (kernarg_pool_base_ != nullptr) {
+      // @note Workaround first access penalty.
+      // KFD may update CPU page tables on the first CPU access
+      *kernarg_pool_base_ = 0;
+    }
   } else {
     kernarg_pool_base_ = reinterpret_cast<address>(roc_device_.hostAlloc(kernarg_pool_size_, 0,
                                                    Device::MemorySegment::kKernArg));
@@ -1425,6 +1509,8 @@ void* VirtualGPU::allocKernArg(size_t size, size_t alignment) {
     //! That means the app didn't call clFlush/clFinish for very long time.
     // Reset the signal for the barrier packet
     hsa_signal_silent_store_relaxed(kernarg_pool_signal_[active_chunk_], kInitSignalValueOne);
+    ClPrint(amd::LOG_INFO, amd::LOG_KERN, "Issue barrier to flush kernel arg chunk %d",
+            active_chunk_);
     // Dispatch a barrier packet into the queue
     dispatchBarrierPacket(kBarrierPacketHeader, true, kernarg_pool_signal_[active_chunk_]);
     // Get the next chunk
@@ -1461,7 +1547,9 @@ address VirtualGPU::allocKernelArguments(size_t size, size_t alignment) {
 * and then calls start() to get the current host timestamp.
 */
 void VirtualGPU::profilingBegin(amd::Command& command, bool sdmaProfiling) {
-  if (command.profilingInfo().enabled_) {
+  // Disable profiling when command is being captured to prevent memory leak from created timestamp_
+  // which won't get freed, since the command is not being executed until graph launch
+  if (!command.getPktCapturingState() && command.profilingInfo().enabled_) {
     if (timestamp_ != nullptr) {
       LogWarning("Trying to create a second timestamp in VirtualGPU. \
                   This could have unintended consequences.");
@@ -1497,7 +1585,7 @@ void VirtualGPU::profilingBegin(amd::Command& command, bool sdmaProfiling) {
       }
     }
   }
-  if (command.getCapturingState()) {
+  if (command.getPktCapturingState()) {
     currCmd_ = &command;
   }
 }
@@ -1508,7 +1596,7 @@ void VirtualGPU::profilingBegin(amd::Command& command, bool sdmaProfiling) {
 * current host timestamp if no signal is available.
 */
 void VirtualGPU::profilingEnd(amd::Command& command) {
-  if (command.profilingInfo().enabled_) {
+  if (!command.getPktCapturingState() && command.profilingInfo().enabled_) {
     if (timestamp_->HwProfiling() == false) {
       timestamp_->end();
     }
@@ -1566,7 +1654,7 @@ void VirtualGPU::updateCommandsState(amd::Command* list) const {
   // also true for any command B, which falls between A and C.
   current = list;
   while (current != nullptr) {
-    if (current->profilingInfo().enabled_) {
+      if (current->profilingInfo().enabled_) {
       if (!current->data().empty()) {
         for (auto i = 0; i < current->data().size(); i++) {
           // Since this is a valid command to get a timestamp, we use the
@@ -2129,7 +2217,68 @@ void VirtualGPU::submitCopyMemoryP2P(amd::CopyMemoryP2PCommand& cmd) {
       }
       break;
     }
-    case CL_COMMAND_COPY_BUFFER_RECT:
+    case CL_COMMAND_COPY_BUFFER_RECT: {
+      if (p2pAllowed) {
+        result = blitMgr().copyBufferRect(*srcDevMem, *dstDevMem, cmd.srcRect(), cmd.dstRect(), size,
+                                          cmd.isEntireMemory(), cmd.copyMetadata());
+      } else {
+        // Sync the current queue, since P2P staging uses the device queues for transfer
+        releaseGpuMemoryFence();
+
+        amd::ScopedLock lock(dev().P2PStageOps());
+        Memory* dstStgMem = static_cast<Memory*>(
+            dev().P2PStage()->getDeviceMemory(*cmd.source().getContext().devices()[0]));
+        Memory* srcStgMem = static_cast<Memory*>(
+            dev().P2PStage()->getDeviceMemory(*cmd.destination().getContext().devices()[0]));
+
+        if ((cmd.srcRect().slicePitch_ * size[2]) <= Device::kP2PStagingSize) {
+          result = true;
+          // Perform 2 step transfer with staging buffer
+          result &= srcDevMem->dev().xferMgr().copyBufferRect(*srcDevMem, *dstStgMem, cmd.srcRect(),
+                                                              cmd.srcRect(), size, false,
+                                                              cmd.copyMetadata());
+
+          result &= dstDevMem->dev().xferMgr().copyBufferRect(*srcStgMem, *dstDevMem, cmd.srcRect(),
+                                                              cmd.dstRect(), size, false,
+                                                              cmd.copyMetadata());
+        }
+        else {
+          size_t srcOffset;
+          size_t dstOffset;
+          result = true;
+
+          for (size_t z = 0; z < size[2]; ++z) {
+            for (size_t y = 0; y < size[1]; ++y) {
+              srcOffset = cmd.srcRect().offset(0, y, z);
+              dstOffset = cmd.dstRect().offset(0, y, z);
+
+              amd::Coord3D srcOrigin(srcOffset);
+              amd::Coord3D dstOrigin(dstOffset);
+              size_t copy_size = Device::kP2PStagingSize;
+              size_t left_size = size[0];
+              amd::Coord3D stageOffset(0);
+              do {
+                if (left_size <= copy_size) {
+                  copy_size = left_size;
+                }
+                left_size -= copy_size;
+
+                // Perform 2 step transfer with staging buffer
+                result &= srcDevMem->dev().xferMgr().copyBuffer(*srcDevMem, *dstStgMem, srcOrigin,
+                                                                stageOffset, copy_size);
+
+                result &= dstDevMem->dev().xferMgr().copyBuffer(*srcStgMem, *dstDevMem, stageOffset,
+                                                                dstOrigin, copy_size);
+
+                srcOrigin.c[0] += copy_size;
+                dstOrigin.c[0] += copy_size;
+              } while (left_size > 0);
+            }
+          }
+        }
+      }
+      break;
+    }
     case CL_COMMAND_COPY_IMAGE:
     case CL_COMMAND_COPY_IMAGE_TO_BUFFER:
     case CL_COMMAND_COPY_BUFFER_TO_IMAGE:
@@ -2241,7 +2390,10 @@ void VirtualGPU::submitMapMemory(amd::MapMemoryCommand& cmd) {
       reinterpret_cast<roc::Memory*>(cmd.memory().getDeviceMemory(dev(), false));
 
   cl_command_type type = cmd.type();
-  bool imageBuffer = false;
+  bool imageBuffer = (cmd.memory().getType() == CL_MEM_OBJECT_IMAGE1D_BUFFER);
+  if (imageBuffer) {
+    type = CL_COMMAND_MAP_BUFFER;
+  }
 
   // Save map requirement.
   cl_map_flags mapFlag = cmd.mapFlags();
@@ -2309,8 +2461,9 @@ void VirtualGPU::submitMapMemory(amd::MapMemoryCommand& cmd) {
         roc::Memory* hsaMapMemory =
             static_cast<roc::Memory*>(mapMemory->getDeviceMemory(dev(), false));
         result =
-            blitMgr().copyImageToBuffer(*hsaMemory, *hsaMapMemory, cmd.origin(), amd::Coord3D(0, 0, 0),
-                                        cmd.size(), cmd.isEntireMemory());
+           blitMgr().copyImageToBuffer(*hsaMemory, *hsaMapMemory, cmd.origin(),
+                                        amd::Coord3D(0, 0, 0), cmd.size(),
+                                        cmd.isEntireMemory());
       } else {
         result = blitMgr().readImage(*hsaMemory, hostPtr, amd::Coord3D(0), image->getRegion(),
                                      image->getRowPitch(), image->getSlicePitch(), true);
@@ -2383,6 +2536,7 @@ void VirtualGPU::submitUnmapMemory(amd::UnmapMemoryCommand& cmd) {
       } else {
         amd::Coord3D origin(mapInfo->origin_[0]);
         amd::Coord3D size(mapInfo->region_[0]);
+        amd::Coord3D dstOrigin(mapInfo->origin_[0]);
         if (imageBuffer) {
           size_t elemSize = cmd.memory().asImage()->getImageFormat().getElementSize();
           origin.c[0] *= elemSize;
@@ -2399,8 +2553,8 @@ void VirtualGPU::submitUnmapMemory(amd::UnmapMemoryCommand& cmd) {
             releaseGpuMemoryFence();
             std::memcpy(hostPtr, svmPtr, size[0]);
           }
-          result = blitMgr().copyBuffer(*hsaMapMemory, *devMemory, mapInfo->origin_, mapInfo->origin_,
-                                        mapInfo->region_, mapInfo->isEntire());
+          result = blitMgr().copyBuffer(*hsaMapMemory, *devMemory, origin, dstOrigin,
+                                        size, mapInfo->isEntire());
         } else {
           result = blitMgr().writeBuffer(cmd.mapPtr(), *devMemory, origin, size);
         }
@@ -2927,7 +3081,7 @@ bool VirtualGPU::createVirtualQueue(uint deviceQueueSize)
 // ================================================================================================
 __attribute__((optimize("unroll-all-loops"), always_inline))
 static inline void nontemporalMemcpy(
-    void* __restrict dst, const void* __restrict src, uint16_t size) {
+    void* __restrict dst, const void* __restrict src, size_t size) {
 #if defined(ATI_ARCH_X86)
 #if defined(__AVX512F__)
   for (auto i = 0u; i != size / sizeof(__m512i); ++i) {
@@ -3022,7 +3176,7 @@ bool VirtualGPU::submitKernelInternal(const amd::NDRangeContainer& sizes,
 
   amd::Memory* const* memories =
       reinterpret_cast<amd::Memory* const*>(parameters + kernelParams.memoryObjOffset());
-  bool isGraphCapture = currCmd_ != nullptr && currCmd_->getCapturingState();
+  bool isGraphCapture = currCmd_ != nullptr && currCmd_->getPktCapturingState();
   for (int j = 0; j < iteration; j++) {
     // Reset global size for dimension dim if split is needed
     if (dim != -1) {
@@ -3242,10 +3396,13 @@ bool VirtualGPU::submitKernelInternal(const amd::NDRangeContainer& sizes,
     if (!kernel.parameters().deviceKernelArgs() || gpuKernel.isInternalKernel()) {
       // Allocate buffer to hold kernel arguments
       if (isGraphCapture) {
-        argBuffer = currCmd_->getKernArgOffset();
+        argBuffer = currCmd_->getKernArgOffset(gpuKernel.KernargSegmentByteSize(),
+                                               gpuKernel.KernargSegmentAlignment());
         currCmd_->SetKernelName(gpuKernel.name());
       } else {
-
+        ClPrint(amd::LOG_INFO, amd::LOG_KERN, "KernargSegmentByteSize = %lu "
+                "KernargSegmentAlignment = %lu", gpuKernel.KernargSegmentByteSize(),
+                gpuKernel.KernargSegmentAlignment());
         argBuffer = reinterpret_cast<address>(
             allocKernArg(gpuKernel.KernargSegmentByteSize(),
                          gpuKernel.KernargSegmentAlignment()));
@@ -3332,9 +3489,9 @@ bool VirtualGPU::submitKernelInternal(const amd::NDRangeContainer& sizes,
     if (isGraphCapture) {
       // Dispatch the packet
       if (!dispatchAqlPacket(&dispatchPacket, aqlHeaderWithOrder,
-                        (sizes.dimensions() << HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS),
-                        GPU_FLUSH_ON_EXECUTION, currCmd_->getCapturingState(),
-                        currCmd_->getAqlPacket())) {
+                             (sizes.dimensions() << HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS),
+                             GPU_FLUSH_ON_EXECUTION, currCmd_->getPktCapturingState(),
+                             currCmd_->getAqlPacket())) {
         return false;
       }
     } else {
@@ -3534,28 +3691,6 @@ void VirtualGPU::flush(amd::Command* list, bool wait) {
 
   // Release all pinned memory
   releasePinnedMem();
-}
-
-// ================================================================================================
-void VirtualGPU::addXferWrite(Memory& memory) {
-  //! @note: ROCr backend doesn't have per resource busy tracking, hence runtime has to wait
-  //!        unconditionally, before it can release pinned memory
-  releaseGpuMemoryFence();
-  if (xferWriteBuffers_.size() > 7) {
-    dev().xferWrite().release(*this, *xferWriteBuffers_.front());
-    xferWriteBuffers_.erase(xferWriteBuffers_.begin());
-  }
-
-  // Delay destruction
-  xferWriteBuffers_.push_back(&memory);
-}
-
-// ================================================================================================
-void VirtualGPU::releaseXferWrite() {
-  for (auto& memory : xferWriteBuffers_) {
-    dev().xferWrite().release(*this, *memory);
-  }
-  xferWriteBuffers_.resize(0);
 }
 
 // ================================================================================================

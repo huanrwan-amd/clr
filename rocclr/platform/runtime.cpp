@@ -82,7 +82,6 @@ bool Runtime::init() {
 
   initialized_ = true;
   pid_ = amd::Os::getProcessId();
-  ClTrace(LOG_DEBUG, LOG_INIT);
   return true;
 }
 
@@ -90,7 +89,6 @@ void Runtime::tearDown() {
   if (!initialized_) {
     return;
   }
-  ClTrace(LOG_DEBUG, LOG_INIT);
 
   Agent::tearDown();
   Device::tearDown();
@@ -99,6 +97,7 @@ void Runtime::tearDown() {
   if (outFile != stderr && outFile != nullptr) {
     fclose(outFile);
   }
+  Command::ReleaseSysmemPool();
   initialized_ = false;
 }
 

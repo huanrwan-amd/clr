@@ -65,6 +65,8 @@ void HSAILKernel::setWorkGroupInfo(const uint32_t privateSegmentSize,
     workGroupInfo_.availableVGPRs_ = 256;
     workGroupInfo_.preferredSizeMultiple_ = workGroupInfo_.wavefrontPerSIMD_ = 64;
   }
+  workGroupInfo_.maxDynamicSharedSizeBytes_ = static_cast<int>(workGroupInfo_.availableLDSSize_ -
+                                                               workGroupInfo_.localMemSize_);
 }
 
 bool HSAILKernel::setKernelCode(amd::hsa::loader::Symbol* sym, amd_kernel_code_t* akc) {
@@ -439,7 +441,8 @@ hsa_kernel_dispatch_packet_t* HSAILKernel::loadArguments(
         WriteAqlArgAt(hidden_arguments, gpu.hsaQueueMem()->vmAddress(), it.size_, it.offset_);
         break;
       case amd::KernelParameterDescriptor::HiddenDynamicLdsSize:
-        WriteAqlArgAt(hidden_arguments, ldsAddress - ldsSize(), it.size_, it.offset_);
+        WriteAqlArgAt(hidden_arguments, static_cast<uint32_t>(ldsAddress - ldsSize()),
+               it.size_, it.offset_);
         break;
     }
   }

@@ -96,7 +96,7 @@ Memory::Memory(Context& context, Type type, Flags flags, size_t size, void* svmP
       svmHostAddress_(svmPtr),
       resOffset_(0),
       flagsEx_(0),
-      lockMemoryOps_("Memory Ops Lock", true) {
+      lockMemoryOps_(true) /* Memory Ops Lock */ {
   svmPtrCommited_ = (flags & CL_MEM_SVM_FINE_GRAIN_BUFFER) ? true : false;
   canBeCached_ = true;
 }
@@ -120,7 +120,7 @@ Memory::Memory(Memory& parent, Flags flags, size_t origin, size_t size, Type typ
       svmHostAddress_(parent.getSvmPtr()),
       resOffset_(0),
       flagsEx_(0),
-      lockMemoryOps_("Memory Ops Lock", true) {
+      lockMemoryOps_(true)  /* Memory Ops Lock */ {
   svmPtrCommited_ = parent.isSvmPtrCommited();
   canBeCached_ = true;
   parent_->retain();
@@ -416,21 +416,21 @@ device::Memory* Memory::getDeviceMemory(const Device& dev, bool alloc) {
 Memory::~Memory() {
   // For_each destructor callback:
   DestructorCallBackEntry* entry;
-  for (entry = destructorCallbacks_; entry != NULL; entry = entry->next_) {
+  for (entry = destructorCallbacks_; entry != nullptr; entry = entry->next_) {
     // invoke the callback function.
     entry->callback_(const_cast<cl_mem>(as_cl(this)), entry->data_);
   }
 
   // Release the parent.
-  if (NULL != parent_) {
+  if (parent_ != nullptr) {
     // Update cache if runtime destroys a subbuffer
-    if (NULL != parent_->getHostMem() && (vDev_ == NULL)) {
+    if (parent_->getHostMem() != nullptr && (vDev_ == nullptr)) {
       cacheWriteBack(nullptr);
     }
     parent_->removeSubBuffer(this);
   }
 
-  if (NULL != deviceMemories_) {
+  if (deviceMemories_ != nullptr) {
     // Destroy all device memory objects
     for (uint i = 0; i < numDevices_; ++i) {
       delete deviceMemories_[i].value_;
@@ -444,19 +444,22 @@ Memory::~Memory() {
 
   // Destroy the destructor callback entries
   DestructorCallBackEntry* callback = destructorCallbacks_;
-  while (callback != NULL) {
+  while (callback != nullptr) {
     DestructorCallBackEntry* next = callback->next_;
     delete callback;
     callback = next;
   }
 
   // Make sure runtime destroys the parent only after subbuffer destruction
-  if (NULL != parent_) {
+  if (parent_ != nullptr) {
     parent_->release();
   }
   hostMemRef_.deallocateMemory(context_());
-  if (getMemFlags() & CL_MEM_VA_RANGE_AMD) {
-    amd::MemObjMap::RemoveVirtualMemObj(getSvmPtr());
+  if (parent_ == nullptr && (getMemFlags() & CL_MEM_VA_RANGE_AMD)) {
+    // The mapping may manually be removed prior to objects destruction
+    if (amd::MemObjMap::FindVirtualMemObj(getSvmPtr())) {
+      amd::MemObjMap::RemoveVirtualMemObj(getSvmPtr());
+    }
     // If runtime executes graph mempool with VM, then VA can be mapped in space
     // for graph validation logic during execution. And the reason it's not unmaped
     // in graph itself because the app can have a graph without a free node
@@ -527,22 +530,36 @@ void Memory::commitSvmMemory() {
   ScopedLock lock(lockMemoryOps_);
   // if VRAM is visible for host, it is not necessary to mmap again
   if (!svmPtrCommited_ && !largeBarSystem_) {
-    amd::Os::commitMemory(svmHostAddress_, size_, amd::Os::MEM_PROT_RW);
-    svmPtrCommited_ = true;
+    if (amd::Os::commitMemory(svmHostAddress_, size_, amd::Os::MEM_PROT_RW)) {
+      svmPtrCommited_ = true;
+    } else {
+      LogPrintfError("Mem Map failed for the host address 0x%x", svmHostAddress_);
+    }
   }
 }
 
 void Memory::uncommitSvmMemory() {
   ScopedLock lock(lockMemoryOps_);
   if (svmPtrCommited_ && !(flags_ & CL_MEM_SVM_FINE_GRAIN_BUFFER)) {
-    amd::Os::uncommitMemory(svmHostAddress_, size_);
-    svmPtrCommited_ = false;
+    if (amd::Os::uncommitMemory(svmHostAddress_, size_)) {
+      svmPtrCommited_ = false;
+    } else {
+      LogPrintfError("Mem Unmap failed for the host address 0x%x", svmHostAddress_);
+    }
   }
 }
 
 Device* Memory::GetDeviceById() {
   size_t device_idx = (userData_.deviceId < getContext().devices().size()) ? userData_.deviceId : 0;
   return getContext().devices()[device_idx];
+}
+
+// =================================================================================================
+bool Memory::ValidateMemAccess(const Device& dev, bool read_write) {
+  if (flags_ & CL_MEM_VA_RANGE_AMD) {
+    return dev.ValidateMemAccess(*this, read_write);
+  }
+  return true;
 }
 
 void Buffer::initDeviceMemory() {
@@ -658,10 +675,6 @@ bool Image::validateDimensions(const std::vector<amd::Device*>& devices, cl_mem_
       }
     // Fall through...
     case CL_MEM_OBJECT_IMAGE2D:
-      if ((width == 0) || (height == 0)) {
-        DevLogPrintfError("Invalid dimensions width: %u height: %u \n", width, height);
-        return false;
-      }
       for (const auto dev : devices) {
         if ((dev->info().image2DMaxHeight_ >= height) && (dev->info().image2DMaxWidth_ >= width)) {
           return true;
@@ -697,10 +710,6 @@ bool Image::validateDimensions(const std::vector<amd::Device*>& devices, cl_mem_
       }
       break;
     case CL_MEM_OBJECT_IMAGE1D_BUFFER:
-      if (width == 0) {
-        DevLogError("Invalid dimension \n");
-        return false;
-      }
       for (const auto& dev : devices) {
         if (dev->info().imageMaxBufferSize_ >= width) {
           return true;

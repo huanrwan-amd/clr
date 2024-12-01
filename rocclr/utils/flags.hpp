@@ -28,6 +28,10 @@ release(int, AMD_LOG_LEVEL, 0,                                                \
         "The default log level")                                              \
 release(uint, AMD_LOG_MASK, 0X7FFFFFFF,                                       \
         "The mask to enable specific kinds of logs")                          \
+release(cstring, AMD_LOG_LEVEL_FILE, "",                                      \
+        "Set output file for AMD_LOG_LEVEL, Default is stderr")               \
+release(size_t, AMD_LOG_LEVEL_SIZE, 2048,                                     \
+        "The max size of AMD_LOG generated in MB if printed to a file")       \
 debug(uint, DEBUG_GPU_FLAGS, 0,                                               \
         "The debug options for GPU device")                                   \
 release(size_t, CQ_THREAD_STACK_SIZE, 256*Ki, /* @todo: that much! */         \
@@ -172,7 +176,7 @@ release(uint, HIP_LAUNCH_BLOCKING, 0,                                         \
 release(bool, PAL_ALWAYS_RESIDENT, false,                                     \
         "Force memory resources to become resident at allocation time")       \
 release(uint, HIP_HOST_COHERENT, 0,                                           \
-        "Coherent memory in hipHostMalloc, 0x1 = memory is coherent with host"\
+        "Coherent memory in hipExtHostAlloc, 0x1 = memory is coherent with host"\
         "0x0 = memory is not coherent between host and GPU")                  \
 release(uint, AMD_OPT_FLUSH, 1,                                               \
         "Kernel flush option , 0x0 = Use system-scope fence operations."      \
@@ -207,8 +211,6 @@ release(bool, PAL_EMBED_KERNEL_MD, false,                                     \
 release(cstring, ROC_GLOBAL_CU_MASK, "",                                      \
         "Sets a global CU mask (entered as hex value) for all queues,"        \
         "Each active bit represents using one CU (e.g., 0xf enables only 4 CUs)") \
-release(cstring, AMD_LOG_LEVEL_FILE, "",                                      \
-        "Set output file for AMD_LOG_LEVEL, Default is stderr")               \
 release(size_t, PAL_PREPINNED_MEMORY_SIZE, 64,                                \
         "Size in KBytes of prepinned memory")                                 \
 release(bool, AMD_CPU_AFFINITY, false,                                        \
@@ -249,12 +251,24 @@ release(bool, HIP_VMEM_MANAGE_SUPPORT, true,                                  \
         "Virtual Memory Management Support")                                  \
 release(bool, DEBUG_HIP_GRAPH_DOT_PRINT, false,                               \
          "Enable/Disable graph debug dot print dump")                         \
+release(bool, DEBUG_HIP_FORCE_ASYNC_QUEUE, false,                             \
+        "Forces grpahs into async queue mode. DEBUG_HIP_FORCE_GRAPH_QUEUES must be 1") \
+release(uint, DEBUG_HIP_FORCE_GRAPH_QUEUES, 4,                                \
+        "Forces the number of streams for the graph parallel execution")      \
 release(bool, HIP_ALWAYS_USE_NEW_COMGR_UNBUNDLING_ACTION, false,              \
         "Force to always use new comgr unbundling action")                    \
+release(uint, DEBUG_HIP_BLOCK_SYNC, 50,                                       \
+        "Blocks synchronization on CPU until the callback processing is done")\
+release(uint, DEBUG_CLR_MAX_BATCH_SIZE, 1000,                                 \
+        "Forces the callback to clean-up CPU submission queue")               \
+release(bool, DEBUG_CLR_SYSMEM_POOL, true,                                    \
+        "Use sysmem pool implementation in runtime for amd commands")         \
 release(bool, DEBUG_HIP_KERNARG_COPY_OPT, true,                               \
         "Enable/Disable multiple kern arg copies")                            \
-release(bool, DEBUG_CLR_USE_STDMUTEX_IN_AMD_MONITOR, true,                    \
-        "Use std::mutext in amd::monotor")                                    \
+release(bool, DEBUG_CLR_USE_STDMUTEX_IN_AMD_MONITOR, false,                   \
+        "Use std::mutex in amd::monotor")                                     \
+release(bool, DEBUG_CLR_KERNARG_HDP_FLUSH_WA, false,                          \
+        "Toggle kernel arg copy workaround")                                  \
 
 namespace amd {
 

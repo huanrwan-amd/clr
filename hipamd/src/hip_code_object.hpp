@@ -103,7 +103,8 @@ private:
 
 //Dynamic Code Object
 class DynCO : public CodeObject {
-  amd::Monitor dclock_{"Guards Dynamic Code object", true};
+  // Guards Dynamic Code object
+  amd::Monitor dclock_{true};
 
 public:
   DynCO() : device_id_(ihipGetDevice()), fb_info_(nullptr) {}
@@ -115,6 +116,7 @@ public:
 
   //Gets GlobalVar/Functions from a dynamically loaded code object
   hipError_t getDynFunc(hipFunction_t* hfunc, std::string func_name);
+  bool isValidDynFunc(const void* hfunc);
   hipError_t getDeviceVar(DeviceVar** dvar, std::string var_name);
 
   hipError_t getManagedVarPointer(std::string name, void** pointer, size_t* size_ptr) const {
@@ -151,7 +153,8 @@ private:
 
 //Static Code Object
 class StatCO: public CodeObject {
-  amd::Monitor sclock_{"Guards Static Code object", true};
+  // Guards Static Code object
+  amd::Monitor sclock_{true};
 public:
   StatCO();
   virtual ~StatCO();

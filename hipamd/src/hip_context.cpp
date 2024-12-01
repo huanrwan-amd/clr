@@ -132,6 +132,9 @@ int getDeviceID(amd::Context& ctx) {
 // ================================================================================================
 hip::Stream* getNullStream(bool wait ) {
   Device* device = getCurrentDevice();
+  if (device == nullptr) {
+    LogError("Invalid device");
+  }
   return device ? device->NullStream(wait) : nullptr;
 }
 
@@ -308,6 +311,11 @@ hipError_t hipCtxGetCacheConfig(hipFuncCache_t* cacheConfig) {
 
 hipError_t hipCtxSetCacheConfig(hipFuncCache_t cacheConfig) {
   HIP_INIT_API(hipCtxSetCacheConfig, cacheConfig);
+
+  if (cacheConfig != hipFuncCachePreferNone && cacheConfig != hipFuncCachePreferShared &&
+      cacheConfig != hipFuncCachePreferL1 && cacheConfig != hipFuncCachePreferEqual) {
+    HIP_RETURN(hipErrorInvalidValue);
+  }
 
   assert(0 && "Unimplemented");
 

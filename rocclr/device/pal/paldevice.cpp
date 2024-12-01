@@ -25,6 +25,8 @@
 #include "device/pal/paldefs.hpp"
 #include "device/pal/palmemory.hpp"
 #include "device/pal/paldevice.hpp"
+#include "device/pal/palgpuopen.hpp"
+#include "device/pal/palubercapturemgr.hpp"
 #include "utils/flags.hpp"
 #include "utils/versions.hpp"
 #include "thread/monitor.hpp"
@@ -59,6 +61,7 @@
 #ifdef PAL_GPUOPEN_OCL
 // gpuutil headers
 #include "gpuUtil/palGpaSession.h"
+#include "palTraceSession.h"
 #include "devDriverServer.h"
 #include "protocols/rgpServer.h"
 #include "protocols/driverControlServer.h"
@@ -800,13 +803,13 @@ Device::ScopedLockVgpus::~ScopedLockVgpus() {
 Device::Device()
     : NullDevice(),
       numOfVgpus_(0),
-      lockAsyncOps_("Device Async Ops Lock", true),
-      lockForInitHeap_("Initialization of Heap Resource", true),
-      lockPAL_("PAL Ops Lock", true),
-      vgpusAccess_("Virtual GPU List Ops Lock", true),
-      scratchAlloc_("Scratch Allocation Lock", true),
-      mapCacheOps_("Map Cache Lock", true),
-      lockResourceOps_("Resource List Ops Lock", true),
+      lockAsyncOps_(true), /* Device Async Ops Lock */
+      lockForInitHeap_(true), /* Initialization of Heap Resource */
+      lockPAL_(true), /* PAL Ops Lock */
+      vgpusAccess_(true), /* Virtual GPU List Ops Lock */
+      scratchAlloc_(true), /* Scratch Allocation Lock */
+      mapCacheOps_(true), /* Map Cache Lock */
+      lockResourceOps_(true), /* Resource List Ops Lock */
       xferRead_(nullptr),
       mapCache_(nullptr),
       resourceCache_(nullptr),
@@ -816,7 +819,7 @@ Device::Device()
       globalScratchBuf_(nullptr),
       srdManager_(nullptr),
       resourceList_(nullptr),
-      rgpCaptureMgr_(nullptr) {}
+      captureMgr_(nullptr) {}
 
 Device::~Device() {
   if (p2p_stage_ != nullptr) {
@@ -877,7 +880,7 @@ Device::~Device() {
   device_ = nullptr;
 
   // Delete developer driver manager
-  delete rgpCaptureMgr_;
+  delete captureMgr_;
 }
 
 extern const char* SchedulerSourceCode;
@@ -969,10 +972,21 @@ bool Device::create(Pal::IDevice* device) {
   // Make sure CP DMA can be used for all possible transfers
   palSettings->cpDmaCmdCopyMemoryMaxBytes = 0xFFFFFFFF;
 
-  // Create RGP capture manager
+  // Create RGP / UberTrace capture manager
   // Note: RGP initialization in PAL must be performed before CommitSettingsAndInit()
-  rgpCaptureMgr_ = RgpCaptureMgr::Create(platform_, *this);
-  if (nullptr != rgpCaptureMgr_) {
+#if PAL_BUILD_RDF
+  if ((platform_->GetTraceSession() != nullptr) &&
+      (platform_->GetTraceSession()->IsTracingEnabled()))
+  {
+    captureMgr_ = UberTraceCaptureMgr::Create(platform_, *this);
+  }
+  else
+#endif
+  {
+    captureMgr_ = RgpCaptureMgr::Create(platform_, *this);
+  }
+
+  if (nullptr != captureMgr_) {
     // KMD forced DWORD alignment for debug VMID, request it back to Unaligned
     palSettings->hardwareBufferAlignmentMode = Pal::BufferAlignmentMode::Unaligned;
     Pal::IPlatform::InstallDeveloperCb(iPlat(), &Device::PalDeveloperCallback, this);
@@ -1113,10 +1127,10 @@ void PAL_STDCALL Device::PalDeveloperCallback(void* pPrivateData, const Pal::uin
 
   switch (type) {
     case Pal::Developer::CallbackType::BarrierBegin:
-      device->rgpCaptureMgr()->WriteBarrierStartMarker(gpu, barrier);
+      device->captureMgr()->WriteBarrierStartMarker(gpu, barrier);
       break;
     case Pal::Developer::CallbackType::BarrierEnd:
-      device->rgpCaptureMgr()->WriteBarrierEndMarker(gpu, barrier);
+      device->captureMgr()->WriteBarrierEndMarker(gpu, barrier);
       break;
     case Pal::Developer::CallbackType::ImageBarrier:
       assert(false);
@@ -1186,10 +1200,10 @@ bool Device::initializeHeapResources() {
     }
 
     // Update RGP capture manager
-    if (rgpCaptureMgr_ != nullptr) {
-      if (!rgpCaptureMgr_->Update(platform_)) {
-        delete rgpCaptureMgr_;
-        rgpCaptureMgr_ = nullptr;
+    if (captureMgr_ != nullptr) {
+      if (!captureMgr_->Update(platform_)) {
+        delete captureMgr_;
+        captureMgr_ = nullptr;
       }
     }
 
@@ -2048,6 +2062,7 @@ bool Device::globalFreeMemory(size_t* freeMemory) const {
     if (system_total_alloced > total_alloced) {
       total_alloced = system_total_alloced;
     }
+    system_total_alloced = mem_budget_info.usage[Pal::GpuHeapGroupNonLocal];
     // Avoid possible negative values in case of extra alignments
     if (mem_budget_info.usage[Pal::GpuHeapGroupNonLocal] >
         (resourceCache().cacheSize() - cache_group_local)) {
@@ -2182,7 +2197,7 @@ void Device::ScratchBuffer::destroyMemory() {
 }
 
 bool Device::allocScratch(uint regNum, const VirtualGPU* vgpu, uint vgprs) {
-  if (regNum > 0) {
+  if (regNum > 0 && vgprs > 0) {
     // Serialize the scratch buffer allocation code
     amd::ScopedLock lk(scratchAlloc_);
     uint sb = vgpu->hwRing();
@@ -2277,7 +2292,13 @@ bool Device::validateKernel(const amd::Kernel& kernel, const device::VirtualDevi
                             bool coop_groups) {
   // Find the number of scratch registers used in the kernel
   const device::Kernel* devKernel = kernel.getDeviceKernel(*this);
-  uint regNum = static_cast<uint>(devKernel->workGroupInfo()->scratchRegs_);
+  uint32_t regNum = static_cast<uint32_t>(devKernel->workGroupInfo()->scratchRegs_);
+  // OCL does not have API to set dynamic stack size i.e. hipDeviceSetLimit and hence there
+  // is no need for OCL to refresh value here and even for HIP, Update should be only if
+  // compiler notifies use of stack size.
+  if (IS_HIP && (devKernel->workGroupInfo()->usedStackSize_ & 0x1) == 0x1) {
+    regNum = std::max<uint32_t>(static_cast<uint32_t>(stack_size_) / sizeof(uint32_t), regNum);
+  }
   const VirtualGPU* vgpu = static_cast<const VirtualGPU*>(vdev);
 
   if (!allocScratch(regNum, vgpu, devKernel->workGroupInfo()->usedVGPRs_)) {
@@ -2488,55 +2509,75 @@ void Device::svmFree(void* ptr) const {
 
 // ================================================================================================
 void* Device::virtualAlloc(void* addr, size_t size, size_t alignment) {
-  amd::Memory* mem = CreateVirtualBuffer(context(), addr, size, -1, true, true);
+  constexpr bool kParent = true;
+  constexpr bool kForceAlloc = true;
+  amd::Memory* mem = CreateVirtualBuffer(context(), addr, size, -1, kParent, kForceAlloc);
   assert(mem != nullptr);
   return mem->getSvmPtr();
 }
 
 // ================================================================================================
-void Device::virtualFree(void* addr) {
+bool Device::virtualFree(void* addr) {
   auto vaddr_mem_obj = amd::MemObjMap::FindVirtualMemObj(addr);
   if (vaddr_mem_obj == nullptr) {
     LogPrintfError("Cannot find any mem_obj for addr: 0x%x \n", addr);
-    return;
+    return false;
   }
 
   if (!vaddr_mem_obj->getContext().devices()[0]->DestroyVirtualBuffer(vaddr_mem_obj)) {
     LogPrintfError("Cannot destroy mem_obj:0x%x for addr: 0x%x \n", vaddr_mem_obj, addr);
+    return false;
   }
+  return true;
 }
 
 // ================================================================================================
 bool Device::SetMemAccess(void* va_addr, size_t va_size, VmmAccess access_flags) {
 
-  amd::Memory* phys_mem_obj = amd::MemObjMap::FindMemObj(va_addr);
-  if (phys_mem_obj == nullptr) {
-    // If the phys_mem_obj is null, the check if this is a valid va_addr, but not-mapped,
+  amd::Memory* amd_mem_obj = amd::MemObjMap::FindMemObj(va_addr);
+  if (amd_mem_obj == nullptr) {
+    // If the amd_mem_obj is null, the check if this is a valid va_addr, but not-mapped,
     // if not-mapped then print a different error message. (No functional change due to this check).
-    amd::Memory* vaddr_mem_obj = amd::MemObjMap::FindVirtualMemObj(va_addr);
-    if (vaddr_mem_obj == nullptr) {
+    amd_mem_obj = amd::MemObjMap::FindVirtualMemObj(va_addr);
+    if (amd_mem_obj == nullptr) {
       LogPrintfError("Cannot find virtual address: 0x%x \n", va_addr);
       return false;
     }
     LogPrintfError("Virtual address present, but not mapped yet: 0x%x \n", va_addr);
-    return false;
   }
 
   // Check for valid size.
-  if (va_size > phys_mem_obj->getSize()) {
+  if (va_size > amd_mem_obj->getSize()) {
     LogPrintfError("Given size: %u cannot be greater than mem_size: %u \n", va_size,
-                    phys_mem_obj->getSize());
+                    amd_mem_obj->getSize());
     return false;
   }
 
-  device::Memory* phys_dev_mem = phys_mem_obj->getDeviceMemory(*this);
-  phys_dev_mem->SetAccess(static_cast<device::Memory::MemAccess>(access_flags));
+  device::Memory* dev_mem_obj = amd_mem_obj->getDeviceMemory(*this);
+  dev_mem_obj->SetAccess(static_cast<device::Memory::MemAccess>(access_flags));
 
   return true;
 }
 
 // ================================================================================================
-bool Device::GetMemAccess(void* va_addr, VmmAccess* access_flags_ptr) {
+bool Device::ValidateMemAccess(amd::Memory& amd_mem_obj, bool read_write) const {
+
+  device::Memory* dev_mem = amd_mem_obj.getDeviceMemory(*this);
+  device::Memory::MemAccess mem_access = dev_mem->GetAccess();
+
+  // If read_write flag is set, then only read_write is valid, else it could be a read or write.
+  if (read_write && mem_access != device::Memory::MemAccess::kMemAccessReadWrite) {
+    return false;
+  } else if ((mem_access != device::Memory::MemAccess::kMemAccessRead)
+              && (mem_access != device::Memory::MemAccess::kMemAccessReadWrite)) {
+    return false;
+  }
+
+  return true;
+}
+
+// ================================================================================================
+bool Device::GetMemAccess(void* va_addr, VmmAccess* access_flags_ptr) const {
 
   amd::Memory* phys_mem_obj = amd::MemObjMap::FindMemObj(va_addr);
   if (phys_mem_obj == nullptr) {
@@ -2547,7 +2588,7 @@ bool Device::GetMemAccess(void* va_addr, VmmAccess* access_flags_ptr) {
       LogPrintfError("Cannot find virtual address: 0x%x \n", va_addr);
       return false;
     }
-    LogPrintfError("Virtual address present, but not mapped yet: 0x%x \n", va_addr);
+    LogPrintfInfo("Virtual address present, but not mapped yet: 0x%x \n", va_addr);
     return false;
   }
 

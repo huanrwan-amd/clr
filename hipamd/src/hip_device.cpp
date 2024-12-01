@@ -36,9 +36,14 @@ hip::Stream* Device::NullStream(bool wait) {
     amd::ScopedLock lock(lock_);
     if (null_stream_ == nullptr) {
       null_stream_ = new Stream(this, Stream::Priority::Normal, 0, true);
+      // Stream creation might be failed from rcor and in that case, vdev is null.
+      if (null_stream_->vdev() == nullptr) {
+        Stream::Destroy(null_stream_);
+      }
     }
   }
   if (null_stream_ == nullptr) {
+    LogError("Cannot create new Stream object");
     return nullptr;
   }
   if (wait == true) {
@@ -185,10 +190,9 @@ void Device::WaitActiveStreams(hip::Stream* blocking_stream, bool wait_null_stre
       waitForStream(null_stream_);
     }
   } else {
-    amd::ScopedLock lock(streamSetLock);
-
-    for (const auto& active_stream : streamSet) {
-      // If it's the current device
+    auto activeQueues = blocking_stream->device().getActiveQueues();
+    for (const auto& command : activeQueues) {
+      hip::Stream* active_stream = static_cast<hip::Stream*>(command);
       if (// Make sure it's a default stream
         ((active_stream->Flags() & hipStreamNonBlocking) == 0) &&
         // and it's not the current stream
@@ -249,6 +253,7 @@ void Device::destroyAllStreams() {
   for (auto& it : toBeDeleted) {
     hip::Stream::Destroy(it);
   }
+  hip::tls.stream_per_thread_obj_.clear_spt();
 }
 
 // ================================================================================================
@@ -269,8 +274,6 @@ void Device::SyncAllStreams( bool cpu_wait) {
   }
   // Release freed memory for all memory pools on the device
   ReleaseFreedMemory();
-  // Release all graph exec objects destroyed by user.
-  ReleaseGraphExec(hip::getCurrentDevice()->deviceId());
 }
 
 // ================================================================================================

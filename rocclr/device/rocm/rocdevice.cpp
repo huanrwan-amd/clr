@@ -71,9 +71,6 @@ static_assert(static_cast<uint32_t>(amd::Device::VmmAccess::kNone)
 static_assert(static_cast<uint32_t>(amd::Device::VmmAccess::kReadOnly)
               == static_cast<uint32_t>(HSA_ACCESS_PERMISSION_RO),
               "Vmm Access Flag Read mismatch with ROCr-runtime!");
-static_assert(static_cast<uint32_t>(amd::Device::VmmAccess::kWriteOnly)
-              == static_cast<uint32_t>(HSA_ACCESS_PERMISSION_WO),
-              "Vmm Access Flag Write mismatch with ROC-runtime!");
 static_assert(static_cast<uint32_t>(amd::Device::VmmAccess::kReadWrite)
               == static_cast<uint32_t>(HSA_ACCESS_PERMISSION_RW),
               "Vmm Access Flag Read Write mismatch with ROC-runtime!");
@@ -182,9 +179,8 @@ Device::Device(hsa_agent_t bkendDevice)
     , alloc_granularity_(0)
     , xferQueue_(nullptr)
     , xferRead_(nullptr)
-    , xferWrite_(nullptr)
     , freeMem_(0)
-    , vgpusAccess_("Virtual GPU List Ops Lock", true)
+    , vgpusAccess_(true) /* Virtual GPU List Ops Lock */
     , hsa_exclusive_gpu_access_(false)
     , queuePool_(QueuePriority::Total)
     , coopHostcallBuffer_(nullptr)
@@ -293,7 +289,6 @@ Device::~Device() {
 
   // Destroy temporary buffers for read/write
   delete xferRead_;
-  delete xferWrite_;
 
   // Destroy transfer queue
   delete xferQueue_;
@@ -679,11 +674,6 @@ bool Device::create() {
                    pciDeviceId_);
     return false;
   }
-  if (agent_isas.count != 1) {
-    LogPrintfError("HSA device %s (PCI ID %x) has %u ISAs but can only support a single ISA",
-                   agent_name, pciDeviceId_, agent_isas.count);
-    return false;
-  }
 
   uint32_t isa_name_length = 0;
   if (HSA_STATUS_SUCCESS !=
@@ -812,7 +802,8 @@ bool Device::create() {
     return false;
   }
 
-  mapCacheOps_ = new amd::Monitor("Map Cache Lock", true);
+  // Map Cache Lock
+  mapCacheOps_ = new amd::Monitor(true);
   if (nullptr == mapCacheOps_) {
     return false;
   }
@@ -825,15 +816,6 @@ bool Device::create() {
   mapCache_->push_back(nullptr);
 
   if (settings().stagedXferSize_ != 0) {
-    // Initialize staged write buffers
-    if (settings().stagedXferWrite_) {
-      xferWrite_ = new XferBuffers(*this, amd::alignUp(settings().stagedXferSize_, 4 * Ki));
-      if ((xferWrite_ == nullptr) || !xferWrite_->create()) {
-        LogError("Couldn't allocate transfer buffer objects for read");
-        return false;
-      }
-    }
-
     // Initialize staged read buffers
     if (settings().stagedXferRead_) {
       xferRead_ = new XferBuffers(*this, amd::alignUp(settings().stagedXferSize_, 4 * Ki));
@@ -847,6 +829,12 @@ bool Device::create() {
   // Create signal for HMM prefetch operation on device
   if (HSA_STATUS_SUCCESS != hsa_signal_create(kInitSignalValueOne, 0, nullptr, &prefetch_signal_)) {
     return false;
+  }
+
+  if (AMD_LOG_LEVEL >= LOG_EXTRA_DEBUG) {
+    uint8_t logMask[8] = { 0 };
+    hsa_flag_set64(logMask, HSA_AMD_LOG_FLAG_BLIT_KERNEL_PKTS);
+    hsa_amd_enable_logging(logMask, outFile);
   }
 
   return true;
@@ -1215,11 +1203,6 @@ bool Device::populateOCLDeviceConstants() {
     return false;
   }
   assert(info_.globalMemCacheLineSize_ > 0);
-
-  // override cache line size to 256 for gfx12, as it is used for kern arg alignment.
-  if ((isa().versionMajor() >= 12) && (info_.globalMemCacheLineSize_ < 256)) {
-    info_.globalMemCacheLineSize_ = 256;
-  }
 
   uint32_t cachesize[4] = {0};
   if (HSA_STATUS_SUCCESS !=
@@ -1823,11 +1806,24 @@ bool Device::populateOCLDeviceConstants() {
   HIP_MEM_POOL_USE_VM &= info_.virtualMemoryManagement_;
 
   switch (isa().versionMajor()) {
+    case (12):
+      if (isa().versionMinor() == 0) {
+        switch (isa().versionStepping()) {
+          case (0):
+          case (1):
+          default:
+            info_.vgprAllocGranularity_ = 24;
+            info_.vgprsPerSimd_ = 1536;
+            break;
+        }
+      }
+      break;
     case (11):
       if (isa().versionMinor() == 0) {
         switch (isa().versionStepping()) {
           case (0):
           case (1):
+          case (5):
             info_.vgprAllocGranularity_ = 24;
             info_.vgprsPerSimd_ = 1536;
             break;
@@ -2482,18 +2478,22 @@ void* Device::virtualAlloc(void* req_addr, size_t size, size_t alignment) {
   return mem->getSvmPtr();
 }
 
-void Device::virtualFree(void* addr) {
+bool Device::virtualFree(void* addr) {
   amd::Memory* memObj = amd::MemObjMap::FindVirtualMemObj(addr);
   if (memObj == nullptr) {
     LogPrintfError("Cannot find the Virtual MemObj entry for this addr 0x%x", addr);
   }
 
-  memObj->getContext().devices()[0]->DestroyVirtualBuffer(memObj);
+  if (!memObj->getContext().devices()[0]->DestroyVirtualBuffer(memObj)) {
+    return false;
+  }
 
   hsa_status_t hsa_status = hsa_amd_vmem_address_free(memObj->getSvmPtr(), memObj->getSize());
   if (hsa_status != HSA_STATUS_SUCCESS) {
     LogPrintfError("Failed hsa_amd_vmem_address_free. Failed with status:%d \n", hsa_status);
+    return false;
   }
+  return true;
 }
 
 bool Device::SetMemAccess(void* va_addr, size_t va_size, VmmAccess access_flags) {
@@ -2511,7 +2511,7 @@ bool Device::SetMemAccess(void* va_addr, size_t va_size, VmmAccess access_flags)
   return true;
 }
 
-bool Device::GetMemAccess(void* va_addr, VmmAccess* access_flags_ptr) {
+bool Device::GetMemAccess(void* va_addr, VmmAccess* access_flags_ptr) const {
   hsa_status_t hsa_status = HSA_STATUS_SUCCESS;
   hsa_access_permission_t perms;
 
@@ -3221,7 +3221,7 @@ hsa_queue_t* Device::acquireQueue(uint32_t queue_size_hint, bool coop_queue,
   return queue;
 }
 
-void Device::releaseQueue(hsa_queue_t* queue, const std::vector<uint32_t>& cuMask) {
+void Device::releaseQueue(hsa_queue_t* queue, const std::vector<uint32_t>& cuMask, bool coop_queue) {
   for (auto& it : cuMask.size() == 0 ? queuePool_ : queueWithCUMaskPool_) {
     auto qIter = it.find(queue);
     if (qIter != it.end()) {
@@ -3248,6 +3248,12 @@ void Device::releaseQueue(hsa_queue_t* queue, const std::vector<uint32_t>& cuMas
       }
     }
   }
+  if (coop_queue) { // cooperative queue
+      ClPrint(amd::LOG_INFO, amd::LOG_QUEUE, "Deleting CG enabled hardware queue %p ",
+               queue->base_address);
+      hsa_queue_destroy(queue);
+  }
+
 }
 
 void* Device::getOrCreateHostcallBuffer(hsa_queue_t* queue, bool coop_queue,

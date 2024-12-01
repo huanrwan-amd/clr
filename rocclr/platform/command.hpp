@@ -114,6 +114,7 @@ class Event : public RuntimeObject {
     uint64_t correlation_id_;
     bool enabled_;        //!< Profiling enabled for the wave limiter
     bool marker_ts_;      //!< TS marker
+    bool batch_flush_ = true; //!< Command can flush the batch in direct dispatch mode
 
    void clear() {
       queued_ = 0ULL;
@@ -152,6 +153,12 @@ class Event : public RuntimeObject {
   }
 
  public:
+  //! Use profiling info to force a tracking signal on command
+  void SetProfiling() {
+    EnableProfiling();
+    profilingInfo_.marker_ts_ = true;
+  }
+
   //! Return the context for this event.
   virtual const Context& context() const = 0;
 
@@ -239,6 +246,12 @@ union CopyMetadata {
         copyEnginePreference_(copyEnginePreference) {}
 };
 
+// Interface to callback to allocate kernel args from the graph kernel arg pool.
+class GraphKernelArgManager {
+ public:
+  virtual address AllocKernArg(size_t size, size_t alignment) = 0;
+};
+
 /*! \brief An operation that is submitted to a command queue.
  *
  *  %Command is the abstract base type of all OpenCL operations
@@ -248,7 +261,7 @@ union CopyMetadata {
  */
 class Command : public Event {
  private:
-  static SysmemPool<ComputeCommand> command_pool_;  //!< Pool of active commands
+  static SysmemPool<ComputeCommand> *command_pool_;  //!< Pool of active commands
   HostQueue* queue_;               //!< The command queue this command is enqueue into
   Command* next_;                  //!< Next GPU command in the queue list
   Command* batch_head_ = nullptr;  //!< The head of the batch commands
@@ -256,8 +269,9 @@ class Command : public Event {
   std::vector<void*> data_;
   const Event* waitingEvent_;  //!< Waiting event associated with the marker
 
-  bool capturing_ = false;           //!< Flag to enable/disable graph gpu packet capture
-  uint8_t* gpuPacket_ = nullptr;     //!< GPU packet to capture, when graph capturing is enabled
+  bool packetCapturing_ = false;           //!< Flag to enable/disable graph gpu packet capture
+  std::vector<uint8_t*>* gpuPackets_;  //!< GPU packets captured when graph capturing is enabled
+  GraphKernelArgManager* graphKernArgMgr_ = nullptr;  //!< KernelMgr for graph
   address kernArgOffset_ = nullptr;  //!< KernelArg buffer to used when graph capturing is enabled
   std::string* capturedKernelName_ = nullptr;  //!< Kenrnel under capture
  protected:
@@ -297,14 +311,21 @@ class Command : public Event {
 
  public:
   //! Returns AQL buffer state
-  bool getCapturingState() const { return capturing_; }
+  static void ReleaseSysmemPool() {
+    if (command_pool_ != nullptr) {
+      delete command_pool_;
+      command_pool_ = nullptr;
+    }
+  }
+  bool getPktCapturingState() const { return packetCapturing_; }
 
   //! Sets AQL capture state, aql packet to capture and where to copy kernArgs
-  void setCapturingState(bool state, uint8_t* packet, address kernArgOffset,
+  void setPktCapturingState(bool state, std::vector<uint8_t*>* packet,
+                         amd::GraphKernelArgManager* graphKernArgMgr,
                          std::string* capturedKernelName) {
-    capturing_ = state;
-    gpuPacket_ = packet;
-    kernArgOffset_ = kernArgOffset;
+    packetCapturing_ = state;
+    gpuPackets_ = packet;
+    graphKernArgMgr_ = graphKernArgMgr;
     capturedKernelName_ = capturedKernelName;
   }
 
@@ -315,11 +336,16 @@ class Command : public Event {
     }
   }
 
-  //! returns the graph executable object command belongs to.
-  const uint8_t* getAqlPacket() const { return gpuPacket_; }
+  //! Returns the graph executable object command belongs to.
+  const uint8_t* getAqlPacket() const {
+    uint8_t* packet = new uint8_t[64];
+    gpuPackets_->push_back(packet);
+    return packet;
+  }
 
-  //! returns the graph executable object command belongs to.
-  const address getKernArgOffset() const { return kernArgOffset_; }
+  address getKernArgOffset(int size, int alignment) {
+    return graphKernArgMgr_->AllocKernArg(size, alignment);
+  }
 
   //! Overload new/delete for fast commands allocation/destruction
   void* operator new(size_t size);
@@ -927,6 +953,8 @@ class CopyMemoryCommand : public TwoMemoryArgsCommand {
   const BufferRect& dstRect() const { return dstRect_; }
   //! Return the copy MetaData
   amd::CopyMetadata copyMetadata() const { return copyMetadata_; }
+  //! Updates copy MetaData
+  void SetCopyMetadata(amd::CopyMetadata copyMetadata) { copyMetadata_ = copyMetadata; }
   //! Updates the host memory to read from
   void setSource(Memory& srcMemory) { memory1_ = &srcMemory; }
   //! Updates the memory object to write to.
@@ -1721,6 +1749,13 @@ class CopyMemoryP2PCommand : public CopyMemoryCommand {
                        Coord3D srcOrigin, Coord3D dstOrigin, Coord3D size)
       : CopyMemoryCommand(queue, cmdType, eventWaitList, srcMemory, dstMemory, srcOrigin, dstOrigin,
                           size) {}
+
+  CopyMemoryP2PCommand(HostQueue& queue, cl_command_type cmdType, const EventWaitList& eventWaitList,
+                    Memory& srcMemory, Memory& dstMemory, Coord3D srcOrigin, Coord3D dstOrigin,
+                    Coord3D size, const BufferRect& srcRect, const BufferRect& dstRect,
+                    amd::CopyMetadata copyMetadata = amd::CopyMetadata())
+      : CopyMemoryCommand(queue, cmdType, eventWaitList, srcMemory, dstMemory, srcOrigin, dstOrigin,
+                          size, srcRect, dstRect) {}
 
   virtual void submit(device::VirtualDevice& device) { device.submitCopyMemoryP2P(*this); }
 

@@ -31,6 +31,7 @@ global:
     hipDeviceGetName;
     hipDeviceGetPCIBusId;
     hipDeviceGetSharedMemConfig;
+    hipDeviceGetTexture1DLinearMaxWidth;
     hipDeviceGetP2PAttribute;
     hipDevicePrimaryCtxGetState;
     hipDevicePrimaryCtxRelease;
@@ -578,3 +579,10 @@ global:
 local:
     *;
 } hip_6.1;
+
+hip_6.3 {
+global:
+    hipExtHostAlloc;
+local:
+    *;
+} hip_6.2;

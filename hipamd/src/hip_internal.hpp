@@ -69,13 +69,26 @@ typedef struct hipArray {
 }hipArray;
 
 namespace hip {
+enum MemcpyType {
+  /// Memcpy from host to host
+  hipHostToHost,
+  /// Memcpy from host to device
+  hipWriteBuffer,
+  /// Memcpy from device to host
+  hipReadBuffer,
+  /// Memcpy from device A to device A
+  /// Memcpy from pinned host buffer to device/device to pinned host buffer
+  hipCopyBuffer,
+  /// Memcpy from device A to device A, user forced to SDMA
+  hipCopyBufferSDMA,
+  /// Memcpy from device A to device B
+  hipCopyBufferP2P,
+};
 struct Graph;
 struct GraphNode;
 struct GraphExec;
 struct UserObject;
 class Stream;
-extern void ReleaseGraphExec(int deviceId);
-extern void ReleaseGraphExec(hip::Stream* stream);
 typedef struct ihipIpcMemHandle_st {
   char ipc_handle[IHIP_IPC_MEM_HANDLE_SIZE];  ///< ipc memory handle on ROCr
   size_t psize;
@@ -269,6 +282,7 @@ public:
   void operator=(const stream_per_thread& ) = delete;
   ~stream_per_thread();
   hipStream_t get();
+  void clear_spt();
 };
 
   class Device;
@@ -342,6 +356,9 @@ public:
     static bool StreamCaptureBlocking();
 
     static void Destroy(hip::Stream* stream);
+
+    virtual bool terminate();
+
     /// Check Stream Capture status to make sure it is done
     static bool StreamCaptureOngoing(hipStream_t hStream);
 
@@ -386,6 +403,8 @@ public:
       pCaptureGraph_ = pGraph;
       captureStatus_ = hipStreamCaptureStatusActive;
     }
+    /// Reset graph to nullptr when capture is invalidated, but keep the status
+    void ResetCaptureGraph() { pCaptureGraph_ = nullptr; }
     void SetCaptureId() {
       // ID is generated in Begin Capture i.e.. when capture status is active
       captureID_ = GenerateCaptureID();
@@ -449,8 +468,10 @@ public:
 
   /// HIP Device class
   class Device : public amd::ReferenceCountedObject {
-    amd::Monitor lock_{"Device lock", true};
-    amd::Monitor streamSetLock{"Guards device stream set"};
+    // Device lock
+    amd::Monitor lock_{true};
+    // Guards device stream set
+    amd::Monitor streamSetLock{};
     std::unordered_set<hip::Stream*> streamSet;
     /// ROCclr context
     amd::Context* context_;
@@ -636,6 +657,7 @@ public:
   extern int ihipGetDevice();
 
   extern hipError_t ihipMalloc(void** ptr, size_t sizeBytes, unsigned int flags);
+  extern hipError_t ihipHostMalloc(void** ptr, size_t sizeBytes, unsigned int flags);
   extern amd::Memory* getMemoryObject(const void* ptr, size_t& offset, size_t size = 0);
   extern amd::Memory* getMemoryObjectWithOffset(const void* ptr, const size_t size = 0);
   extern void getStreamPerThread(hipStream_t& stream);

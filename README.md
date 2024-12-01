@@ -1,12 +1,12 @@
 # AMD CLR - Compute Language Runtimes
 
-AMD CLR (Common Language Runtime) contains source codes for AMD's compute languages runtimes: `HIP` and `OpenCL™`.
+AMD CLR (Compute Language Runtime) contains source codes for AMD's compute languages runtimes: `HIP` and `OpenCL™`.
 
 ## Project Organisation
 
 - `hipamd` - contains implementation of `HIP` language on AMD platform. It is hosted at [ROCm/clr/hipamd](https://github.com/ROCm/clr/tree/develop/hipamd)
 - `opencl` - contains implementation of [OpenCL™](https://www.khronos.org/opencl/) on AMD platform. Now it is hosted at [ROCm/clr/opencl](https://github.com/ROCm/clr/tree/develop/opencl)
-- `rocclr` - contains common runtime used in `HIP` and `OpenCL™`. This is hosted at [ROCm/clr/rocclr](https://github.com/ROCm/clr/tree/develop/rocclr)
+- `rocclr` - contains compute runtime used in `HIP` and `OpenCL™`. This is hosted at [ROCm/clr/rocclr](https://github.com/ROCm/clr/tree/develop/rocclr)
 
 ## How to build/install
 
@@ -56,7 +56,7 @@ To run `hip-tests` please go to the repository and follow the steps.
 
 ## Release notes
 
-HIP provides release notes in [CLR change log](https://github.com/ROCm/clr/blob/develop/CHANGELOG.md), which has the records of changes in each release.
+HIP provides release notes in [CLR change log](./CHANGELOG.md), which has the records of changes in each release.
 
 ## Disclaimer
 

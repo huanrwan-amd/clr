@@ -23,6 +23,7 @@
 #include "hip_event.hpp"
 #include "thread/monitor.hpp"
 #include "hip_prof_api.h"
+#include <atomic>
 
 namespace hip {
 
@@ -75,8 +76,14 @@ bool Stream::Create() {
 void Stream::Destroy(hip::Stream* stream) {
   stream->device_->RemoveStream(stream);
   stream->release();
+  stream = nullptr;
 }
 
+// ================================================================================================
+bool Stream::terminate() {
+  HostQueue::terminate();
+  return true;
+}
 // ================================================================================================
 bool isValid(hipStream_t& stream) {
   // NULL stream is always valid
@@ -110,8 +117,9 @@ int Stream::DeviceId(const hipStream_t hStream) {
     //return invalid device id
     return -1;
   }
+  bool isNullOrLegacyStream = (hStream == nullptr || hStream == hipStreamLegacy);
   hip::Stream* s = reinterpret_cast<hip::Stream*>(inputStream);
-  int deviceId = (s != nullptr)? s->DeviceId() : ihipGetDevice();
+  int deviceId = isNullOrLegacyStream ? ihipGetDevice() : s->DeviceId();
   assert(deviceId >= 0 && deviceId < static_cast<int>(g_devices.size()));
   return deviceId;
 }
@@ -129,8 +137,12 @@ bool Stream::StreamCaptureBlocking() {
 }
 
 bool Stream::StreamCaptureOngoing(hipStream_t hStream) {
+  if (hStream == nullptr || hStream == hipStreamLegacy) {
+    return false;
+  }
+
   hip::Stream* s = reinterpret_cast<hip::Stream*>(hStream);
-  if (s != nullptr && s->GetCaptureStatus() == hipStreamCaptureStatusNone) {
+  if (s->GetCaptureStatus() == hipStreamCaptureStatusNone) {
     // If current thread is capturing in relaxed mode
     if (hip::tls.stream_capture_mode_ == hipStreamCaptureModeRelaxed) {
       return false;
@@ -151,10 +163,10 @@ bool Stream::StreamCaptureOngoing(hipStream_t hStream) {
       return true;
     }
     return false;
-  } else if (s != nullptr && s->GetCaptureStatus() == hipStreamCaptureStatusActive) {
+  } else if (s->GetCaptureStatus() == hipStreamCaptureStatusActive) {
     s->SetCaptureStatus(hipStreamCaptureStatusInvalidated);
     return true;
-  } else if (s != nullptr && s->GetCaptureStatus() == hipStreamCaptureStatusInvalidated) {
+  } else if (s->GetCaptureStatus() == hipStreamCaptureStatusInvalidated) {
     return true;
   }
   return false;
@@ -227,6 +239,12 @@ hipStream_t stream_per_thread::get() {
     }
   }
   return m_streams[currDev];
+}
+
+void stream_per_thread::clear_spt() {
+  if (!m_streams.empty()) {
+    m_streams[getCurrentDevice()->deviceId()] = nullptr;
+  }
 }
 
 
@@ -333,24 +351,17 @@ hipError_t hipStreamSynchronize_common(hipStream_t stream) {
   if (!hip::isValid(stream)) {
     HIP_RETURN(hipErrorContextIsDestroyed);
   }
-  if (stream != nullptr) {
+  if (stream != nullptr && stream != hipStreamLegacy) {
     // If still capturing return error
     if (hip::Stream::StreamCaptureOngoing(stream) == true) {
       HIP_RETURN(hipErrorStreamCaptureUnsupported);
     }
   }
-  bool wait = (stream == nullptr) ? true : false;
-  constexpr bool kDontWaitForCpu = false;
-
+  bool wait = (stream == nullptr || stream == hipStreamLegacy) ? true : false;
   auto hip_stream = hip::getStream(stream, wait);
+
   // Wait for the current host queue
-  hip_stream->finish(kDontWaitForCpu);
-  if (stream == nullptr) {
-    // null stream will sync with other streams.
-    ReleaseGraphExec(hip_stream->DeviceId());
-  } else {
-    ReleaseGraphExec(hip_stream);
-  }
+  hip_stream->finish();
   // Release freed memory for all memory pools on the device
   hip_stream->GetDevice()->ReleaseFreedMemory();
   return hipSuccess;

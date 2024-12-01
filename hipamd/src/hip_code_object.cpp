@@ -965,6 +965,19 @@ DynCO::~DynCO() {
       hipError_t err = ihipFree(elem.second->getManagedVarPtr());
       assert(err == hipSuccess);
     }
+
+    if (elem.second->getVarKind() == Var::DVK_Variable) {
+      for (auto dev : g_devices) {
+        DeviceVar* dvar = nullptr;
+        hipError_t err = elem.second->getDeviceVarPtr(&dvar, dev->deviceId());
+        assert(err == hipSuccess);
+        if (dvar != nullptr) {
+          // free also deletes the device ptr
+          err = ihipFree(dvar->device_ptr());
+          assert(err == hipSuccess);
+        }
+      }
+    }
     delete elem.second;
   }
   vars_.clear();
@@ -1009,6 +1022,12 @@ hipError_t DynCO::getDynFunc(hipFunction_t* hfunc, std::string func_name) {
 
   /* See if this could be solved */
   return it->second->getDynFunc(hfunc, module());
+}
+
+bool DynCO::isValidDynFunc(const void* hfunc) {
+  amd::ScopedLock lock(dclock_);
+  return std::any_of(functions_.begin(), functions_.end(),
+                     [&](auto& it) { return it.second->isValidDynFunc(hfunc); });
 }
 
 hipError_t DynCO::initDynManagedVars(const std::string& managedVar) {
@@ -1170,13 +1189,19 @@ hipError_t StatCO::removeFatBinary(FatBinaryInfo** module) {
   auto it = managedVars_.begin();
   while (it != managedVars_.end()) {
     if ((*it)->moduleInfo() == module) {
+      hipError_t err;
       for (auto dev : g_devices) {
         DeviceVar* dvar = nullptr;
-        IHIP_RETURN_ONFAIL((*it)->getStatDeviceVar(&dvar, dev->deviceId()));
-        // free also deletes the device ptr
-        hipError_t err = ihipFree(dvar->device_ptr());
-        assert(err == hipSuccess);
+        IHIP_RETURN_ONFAIL((*it)->getDeviceVarPtr(&dvar, dev->deviceId())); 
+        if (dvar != nullptr) {
+          // free also deletes the device ptr
+          err = ihipFree(dvar->device_ptr());
+          assert(err == hipSuccess);
+        }
       }
+      err = ihipFree(*(static_cast<void**>((*it)->getManagedVarPtr())));
+      assert(err == hipSuccess);
+      delete *it;
       it = managedVars_.erase(it);
     } else {
       ++it;
@@ -1211,8 +1236,10 @@ hipError_t StatCO::registerStatFunction(const void* hostFunction, Function* func
 
   if (functions_.find(hostFunction) != functions_.end()) {
     DevLogPrintfError("hostFunctionPtr: 0x%x already exists", hostFunction);
+    delete func;
+  } else {
+    functions_.insert(std::make_pair(hostFunction, func));
   }
-  functions_.insert(std::make_pair(hostFunction, func));
 
   return hipSuccess;
 }

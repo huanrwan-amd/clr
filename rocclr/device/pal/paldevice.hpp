@@ -36,7 +36,7 @@
 #include "device/pal/paldefs.hpp"
 #include "device/pal/palsettings.hpp"
 #include "device/pal/palappprofile.hpp"
-#include "device/pal/palgpuopen.hpp"
+#include "device/pal/palcapturemgr.hpp"
 #include "device/pal/palsignal.hpp"
 #include "acl.h"
 #include "memory"
@@ -145,13 +145,17 @@ class NullDevice : public amd::Device {
   }
   virtual void svmFree(void* ptr) const { return; }
   virtual void* virtualAlloc(void* addr, size_t size, size_t alignment) { return nullptr; };
-  virtual void virtualFree(void* addr) { };
+  virtual bool virtualFree(void* addr) { return true; }
 
   virtual bool SetMemAccess(void* va_addr, size_t va_size, VmmAccess access_flags) {
     return true;
   }
 
-  virtual bool GetMemAccess(void* va_addr, VmmAccess* access_flags_ptr) {
+  virtual bool GetMemAccess(void* va_addr, VmmAccess* access_flags_ptr) const {
+    return true;
+  }
+
+  virtual bool ValidateMemAccess(amd::Memory& mem, bool read_write) const {
     return true;
   }
 
@@ -255,7 +259,7 @@ class Device : public NullDevice {
     amd::Monitor queue_lock_;       //!< Queue lock for access
     AqlPacketMgmt aql_packet_mgmt_; //!< AQL packets management class for debugger support
     QueueRecycleInfo() : counter_(1), engineType_(Pal::EngineTypeCompute), index_(0),
-          queue_lock_("Queue lock for sharing", true) {}
+          queue_lock_(true) /* Queue lock for sharing */ {}
 
     //! Returns the aql packet list
     uintptr_t AqlPacketList() const {
@@ -557,11 +561,12 @@ class Device : public NullDevice {
 
   //! Virtual address space allocation(reservation)
   virtual void* virtualAlloc(void* addr, size_t size, size_t alignment);
-  virtual void virtualFree(void* addr);
+  virtual bool virtualFree(void* addr);
 
   //! Set/Get memory access set by the app
   virtual bool SetMemAccess(void* va_addr, size_t va_size, VmmAccess access_flags);
-  virtual bool GetMemAccess(void* va_addr, VmmAccess* access_flags_ptr);
+  virtual bool GetMemAccess(void* va_addr, VmmAccess* access_flags_ptr) const;
+  virtual bool ValidateMemAccess(amd::Memory& mem, bool read_write) const;
 
   virtual bool ExportShareableVMMHandle(amd::Memory& amd_mem_obj, int flags, void* shareableHandle);
 
@@ -582,7 +587,8 @@ class Device : public NullDevice {
   //! Allow access for peer device
   bool deviceAllowAccess(void* dst) const;
 
-  RgpCaptureMgr* rgpCaptureMgr() const { return rgpCaptureMgr_; }
+  //! Returns a handle to the capture manager (RGP or UberTrace)
+  ICaptureMgr* captureMgr() const { return captureMgr_; }
 
   //! Update free memory for OCL extension
   void updateAllocedMemory(Pal::GpuHeap heap,  //!< PAL GPU heap for update
@@ -670,6 +676,10 @@ class Device : public NullDevice {
   //! Allocates hidden heap for device memory allocations
   void HiddenHeapAlloc(const VirtualGPU& gpu);
 
+  const Pal::GpuMemoryHeapProperties& GetGpuHeapInvisible() const {
+    return heaps_[Pal::GpuHeapInvisible];
+  }
+
  private:
   static void PAL_STDCALL PalDeveloperCallback(void* pPrivateData, const Pal::uint32 deviceIndex,
                                                Pal::Developer::CallbackType type, void* pCbData);
@@ -741,7 +751,7 @@ class Device : public NullDevice {
   mutable std::atomic<Pal::gpusize>
       allocedMem[Pal::GpuHeap::GpuHeapCount];    //!< Free memory counter
   std::unordered_set<Resource*>* resourceList_;  //!< Active resource list
-  RgpCaptureMgr* rgpCaptureMgr_;                 //!< RGP capture manager
+  ICaptureMgr* captureMgr_;                      //!< RGP/UberTrace capture manager
   Pal::GpuMemoryHeapProperties
       heaps_[Pal::GpuHeapCount];         //!< Information about heaps, returned from PAL
   std::map<Pal::IQueue*, QueueRecycleInfo*> queue_pool_;  //!< Pool of PAL queues for recycling
