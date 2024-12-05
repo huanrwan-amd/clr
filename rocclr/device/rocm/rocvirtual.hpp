@@ -30,6 +30,9 @@
 #include "rocprintf.hpp"
 #include "hsa/hsa_ven_amd_aqlprofile.h"
 #include "rocsched.hpp"
+#include "device/device.hpp"
+#include <stack>
+
 
 namespace amd::roc {
 class Device;
@@ -270,7 +273,11 @@ class VirtualGPU : public device::VirtualDevice {
       sdma_profiling_ = profile;
       hsa_amd_profiling_async_copy_enable(profile);
     }
+
   private:
+    //! Creates HSA signal with the specified scope
+    bool CreateSignal(ProfilingSignal* signal, bool interrupt = false) const;
+
     //! Wait for the next active signal
     void WaitNext() {
       size_t next = (current_id_ + 1) % signal_list_.size();
@@ -282,6 +289,8 @@ class VirtualGPU : public device::VirtualDevice {
     bool CpuWaitForSignal(ProfilingSignal* signal);
 
     HwQueueEngine engine_ = HwQueueEngine::Unknown; //!< Engine used in the current operations
+    std::stack<ProfilingSignal*> signal_pool_irq_;  //!< The pool of free signals with interrupts
+    std::stack<ProfilingSignal*> signal_pool_;      //!< The pool of free signals without interrupt
     std::vector<ProfilingSignal*> signal_list_;     //!< The pool of all signals for processing
     size_t current_id_ = 0;       //!< Last submitted signal
     bool sdma_profiling_ = false; //!< If TRUE, then SDMA profiling is enabled
