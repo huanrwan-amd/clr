@@ -1063,7 +1063,7 @@ amd::Image* ihipImageCreate(const cl_channel_order channelOrder,
                                        imageType,
                                        CL_MEM_READ_WRITE,
                                        imageFormat,
-                                       (imageWidth == 0) ? 1 : imageWidth,
+                                       imageWidth,
                                        (imageHeight == 0) ? 1 : imageHeight,
                                        (imageDepth == 0) ? 1 : imageDepth,
                                        imageRowPitch,
@@ -4621,7 +4621,7 @@ hipError_t hipExternalMemoryGetMappedMipmappedArray(
                                           hip::getNumChannels(mipmapDesc->formatDesc),
                                           mipmapDesc->flags};
   if (!hip::CheckArrayFormat(mipmapDesc->formatDesc)) {
-    return HIP_RETURN(hipErrorInvalidValue);
+    HIP_RETURN(hipErrorInvalidValue);
   }
 
   HIP_RETURN(ihipMipmapArrayCreate(mipmap, &allocateArray, mipmapDesc->numLevels,
