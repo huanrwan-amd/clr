@@ -46,12 +46,6 @@ struct GraphNode;
 struct GraphExec;
 struct UserObject;
 typedef GraphNode* Node;
-hipError_t FillCommands(std::vector<std::vector<Node>>& parallelLists,
-                        std::unordered_map<Node, std::vector<Node>>& nodeWaitLists,
-                        std::vector<Node>& topoOrder, Graph* clonedGraph, amd::Command*& graphStart,
-                        amd::Command*& graphEnd, hip::Stream* stream);
-void UpdateStream(std::vector<std::vector<Node>>& parallelLists, hip::Stream* stream,
-                  GraphExec* ptr);
 hipError_t EnqueueGraphWithSingleList(std::vector<hip::Node>& topoOrder, hip::Stream* hip_stream,
                                       hip::GraphExec* graphExec = nullptr);
 struct UserObject : public amd::ReferenceCountedObject {
@@ -380,9 +374,6 @@ struct GraphNode : public hipGraphNodeDOTAttribute {
       edges_.push_back(entry);
     }
   }
-  /// Get Runlist of the nodes embedded as part of the graphnode(e.g. ChildGraph)
-  virtual void GetRunList(std::vector<std::vector<Node>>& parallelList,
-                          std::unordered_map<Node, std::vector<Node>>& dependencies) {}
   /// Get topological sort of the nodes embedded as part of the graphnode(e.g. ChildGraph)
   virtual bool TopologicalOrder(std::vector<Node>& TopoOrder) { return true; }
   /// Update waitlist of the nodes embedded as part of the graphnode(e.g. ChildGraph)
@@ -391,7 +382,6 @@ struct GraphNode : public hipGraphNodeDOTAttribute {
       command->updateEventWaitList(waitList);
     }
   }
-  virtual hipError_t GetNumParallelStreams(size_t &num) { return hipSuccess; }
   /// Enqueue commands part of the node
   virtual void EnqueueCommands(hip::Stream* stream) {
     // If the node is disabled it becomes empty node. To maintain ordering just enqueue marker.
@@ -488,7 +478,7 @@ struct Graph {
   std::unordered_map<UserObject*, int> graphUserObj_;
   unsigned int id_;
   static int nextID;
-  int max_streams_ = 0;       //!< Maximum number of extra streams used in the graph launch
+  int max_streams_ = 0;       //!< Maximum number of streams used in the graph launch
   uint32_t memalloc_nodes_ = 0; //!< Count of unreleased Memalloc nodes
   std::vector<Node> roots_;   //!< Root nodes, used in parallel launches
   std::vector<Node> leafs_;   //!< The list of leaf nodes on every parallel stream
@@ -616,12 +606,6 @@ struct Graph {
   // Delete user obj resource from graph
   void RemoveUserObjGraph(UserObject* pUserObj) { graphUserObj_.erase(pUserObj); }
 
-  void GetRunListUtil(Node v, std::unordered_map<Node, bool>& visited,
-                      std::vector<Node>& singleList, std::vector<std::vector<Node>>& parallelLists,
-                      std::unordered_map<Node, std::vector<Node>>& dependencies);
-  void GetRunList(std::vector<std::vector<Node>>& parallelLists,
-                  std::unordered_map<Node, std::vector<Node>>& dependencies);
-
   //! Schedules one node on a vitual stream.
   //! It will also process the nodes in edges, using recursion
   void ScheduleOneNode(
@@ -742,10 +726,8 @@ struct Graph {
 struct GraphKernelNode;
 
 struct GraphExec : public amd::ReferenceCountedObject {
-  std::vector<std::vector<Node>> parallelLists_;
   //! Topological order of the graph doesn't include nodes embedded as part of the child graph
   std::vector<Node> topoOrder_;
-  std::unordered_map<Node, std::vector<Node>> nodeWaitLists_;
   struct Graph* clonedGraph_;
   std::vector<hip::Stream*> parallel_streams_;
   hip::Stream* capture_stream_;
@@ -761,13 +743,10 @@ struct GraphExec : public amd::ReferenceCountedObject {
   bool repeatLaunch_ = false;
 
  public:
-  GraphExec(std::vector<Node>& topoOrder, std::vector<std::vector<Node>>& lists,
-            std::unordered_map<Node, std::vector<Node>>& nodeWaitLists, struct Graph*& clonedGraph,
+  GraphExec(std::vector<Node>& topoOrder, struct Graph*& clonedGraph,
             std::unordered_map<Node, Node>& clonedNodes, uint64_t flags = 0)
       : ReferenceCountedObject(),
-        parallelLists_(lists),
         topoOrder_(topoOrder),
-        nodeWaitLists_(nodeWaitLists),
         clonedGraph_(clonedGraph),
         clonedNodes_(clonedNodes),
         lastEnqueuedCommand_(nullptr),
@@ -841,8 +820,6 @@ struct GraphExec : public amd::ReferenceCountedObject {
 struct ChildGraphNode : public GraphNode {
   struct Graph* childGraph_;
   std::vector<Node> childGraphNodeOrder_;
-  std::vector<std::vector<Node>> parallelLists_;
-  std::unordered_map<Node, std::vector<Node>> nodeWaitLists_;
   amd::Command* lastEnqueuedCommand_;
   amd::Command* startCommand_;
   amd::Command* endCommand_;
@@ -877,84 +854,26 @@ struct ChildGraphNode : public GraphNode {
     return childGraphNodeOrder_;
   }
 
-  std::vector<std::vector<Node>>& GetParallelLists() {
-    return parallelLists_;
-  }
-
-
-  hipError_t GetNumParallelStreams(size_t &num) override {
-    if (false == TopologicalOrder(childGraphNodeOrder_)) {
-      return hipErrorInvalidValue;
-    }
-    for (auto& node : childGraphNodeOrder_) {
-      if (hipSuccess != node->GetNumParallelStreams(num)) {
-        return hipErrorInvalidValue;
-      }
-    }
-    // returns total number of parallel queues required for child graph nodes to be launched
-    // first parallel list will be launched on the same queue as parent
-    num += (parallelLists_.size() - 1);
-    return hipSuccess;
-  }
-
   void SetStream(hip::Stream* stream, GraphExec* ptr = nullptr) override {
     stream_ = stream;
-    UpdateStream(parallelLists_, stream, ptr);
   }
 
-  // For nodes that are dependent on the child graph node waitlist is the last node of the first
-  // parallel list
-  std::vector<amd::Command*>& GetCommands() override {
-    return parallelLists_[0].back()->GetCommands();
-  }
-
-  // Create child graph node commands and set waitlists
-  hipError_t CreateCommand(hip::Stream* stream) override {
-    hipError_t status = GraphNode::CreateCommand(stream);
-    if (status != hipSuccess) {
-      return status;
-    }
-    startCommand_ = nullptr;
-    endCommand_ = nullptr;
-    if (!graphCaptureStatus_) {
-      status = FillCommands(parallelLists_, nodeWaitLists_, childGraphNodeOrder_, childGraph_,
-                            startCommand_, endCommand_, stream);
-    }
-    return status;
-  }
-
-  //
-  void UpdateEventWaitLists(const amd::Command::EventWaitList& waitList) override {
-    if (startCommand_ != nullptr) {
-      startCommand_->updateEventWaitList(waitList);
-    }
-  }
-
-  void GetRunList(std::vector<std::vector<Node>>& parallelList,
-                  std::unordered_map<Node, std::vector<Node>>& dependencies) override {
-    childGraph_->GetRunList(parallelLists_, nodeWaitLists_);
-  }
   bool TopologicalOrder(std::vector<Node>& TopoOrder) override {
     return childGraph_->TopologicalOrder(TopoOrder);
   }
+
+  bool TopologicalOrder() { return childGraph_->TopologicalOrder(childGraphNodeOrder_); }
+
   void EnqueueCommands(hip::Stream* stream) override {
     if (graphCaptureStatus_) {
       hipError_t status =
           EnqueueGraphWithSingleList(childGraphNodeOrder_, stream);
-    } else {
-      // enqueue child graph start command
-      if (startCommand_ != nullptr) {
-        startCommand_->enqueue();
-        startCommand_->release();
-      }
-      // enqueue nodes in child graph in level order
-      for (auto& node : childGraphNodeOrder_) {
-        node->EnqueueCommands(stream);
-      }
-      // enqueue child graph end command
-      if (endCommand_ != nullptr) {
-        endCommand_->enqueue();
-        endCommand_->release();
+    } else if (childGraph_->max_streams_ == 1) {
+      for (int i = 0; i < childGraphNodeOrder_.size(); i++) {
+        childGraphNodeOrder_[i]->SetStream(stream_);
+        hipError_t status =
+            childGraphNodeOrder_[i]->CreateCommand(childGraphNodeOrder_[i]->GetQueue());
+        childGraphNodeOrder_[i]->EnqueueCommands(stream_);
       }
     }
   }
@@ -992,6 +911,7 @@ class GraphKernelNode : public GraphNode {
   unsigned int kernelAttrInUse_;       //!< Kernel attributes in use
   ihipExtKernelEvents kernelEvents_;   //!< Events for Ext launch kernel
   bool hasHiddenHeap_;                 //!< Kernel has hidden heap(device side allocation)
+  int coopKernel_;                     //!< Launch cooperative kernel
 
  public:
   bool HasHiddenHeap() const { return hasHiddenHeap_; }
@@ -1183,7 +1103,8 @@ class GraphKernelNode : public GraphNode {
     return hipSuccess;
   }
 
-  GraphKernelNode(const hipKernelNodeParams* pNodeParams, const ihipExtKernelEvents* pEvents)
+  GraphKernelNode(const hipKernelNodeParams* pNodeParams, const ihipExtKernelEvents* pEvents,
+                  int coopKernel = 0)
       : GraphNode(hipGraphNodeTypeKernel, "bold", "octagon", "KERNEL") {
     kernelParams_ = *pNodeParams;
     kernelEvents_ = { 0 };
@@ -1196,6 +1117,7 @@ class GraphKernelNode : public GraphNode {
     memset(&kernelAttr_, 0, sizeof(kernelAttr_));
     kernelAttrInUse_ = 0;
     hasHiddenHeap_ = false;
+    coopKernel_ = coopKernel;
   }
 
   ~GraphKernelNode() { freeParams(); }
@@ -1225,6 +1147,7 @@ class GraphKernelNode : public GraphNode {
   GraphKernelNode(const GraphKernelNode& rhs) : GraphNode(rhs) {
     kernelParams_ = rhs.kernelParams_;
     kernelEvents_ = rhs.kernelEvents_;
+    coopKernel_ = rhs.coopKernel_;
     hipError_t status = copyParams(&rhs.kernelParams_);
     if (status != hipSuccess) {
       ClPrint(amd::LOG_ERROR, amd::LOG_CODE, "[hipGraph] Failed to allocate memory to copy params");
@@ -1275,9 +1198,9 @@ class GraphKernelNode : public GraphNode {
         command, func, kernelParams_.gridDim.x * kernelParams_.blockDim.x,
         kernelParams_.gridDim.y * kernelParams_.blockDim.y,
         kernelParams_.gridDim.z * kernelParams_.blockDim.z, kernelParams_.blockDim.x,
-        kernelParams_.blockDim.y, kernelParams_.blockDim.z, kernelParams_.sharedMemBytes,
-        stream, kernelParams_.kernelParams, kernelParams_.extra, kernelEvents_.startEvent_,
-        kernelEvents_.stopEvent_, flags, 0, 0, 0, 0, 0, 0);
+        kernelParams_.blockDim.y, kernelParams_.blockDim.z, kernelParams_.sharedMemBytes, stream,
+        kernelParams_.kernelParams, kernelParams_.extra, kernelEvents_.startEvent_,
+        kernelEvents_.stopEvent_, flags, coopKernel_, 0, 0, 0, 0, 0);
     if (signal_is_required_) {
       // Optimize the barriers by adding a signal into the dispatch packet directly
       command->SetProfiling();
